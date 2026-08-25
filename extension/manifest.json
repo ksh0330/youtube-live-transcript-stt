@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Live Transcript STT",
+  "short_name": "YT Live STT",
+  "version": "0.2.3",
+  "description": "YouTube 탭 오디오를 로컬 Whisper로 실시간 전사하고 TXT/SRT/VTT/JSON으로 저장합니다.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "downloads",
+    "tabs",
+    "activeTab",
+    "tabCapture",
+    "offscreen",
+    "windows"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://youtube.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "YouTube Live STT 시작",
+    "default_popup": "launcher.html"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:8765 http://127.0.0.1:8765;"
+  }
+}

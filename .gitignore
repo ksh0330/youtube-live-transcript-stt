@@ -1,0 +1,6 @@
+local-stt-server/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+benchmark-results/
+

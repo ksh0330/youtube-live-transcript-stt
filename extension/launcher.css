@@ -1,0 +1,114 @@
+:root {
+  color-scheme: light dark;
+  --bg:#101216;
+  --panel:#191d24;
+  --text:#f6f7f9;
+  --muted:#9ca6b3;
+  --border:#303642;
+  --accent:#ff3b30;
+  --green:#31c48d;
+  --yellow:#f5b942;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0;
+  width:340px;
+  background:var(--bg);
+  color:var(--text);
+  font-family:Inter, Pretendard, "Noto Sans KR", Arial, sans-serif;
+}
+.launcher { padding:16px; }
+.eyebrow {
+  margin:0 0 4px;
+  color:var(--accent);
+  font-size:10px;
+  font-weight:800;
+  letter-spacing:.14em;
+}
+h1 { margin:0 0 10px; font-size:19px; }
+.tab-title {
+  margin:0 0 14px;
+  color:var(--muted);
+  font-size:11px;
+  line-height:1.45;
+  max-height:34px;
+  overflow:hidden;
+}
+.status {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:10px 11px;
+  border:1px solid var(--border);
+  border-radius:10px;
+  background:var(--panel);
+  font-size:11px;
+}
+.dot {
+  width:9px;
+  height:9px;
+  border-radius:50%;
+  background:var(--yellow);
+  flex:none;
+}
+.dot.ok { background:var(--green); }
+.dot.error { background:var(--accent); }
+.message {
+  margin:10px 1px;
+  color:var(--muted);
+  font-size:10px;
+  line-height:1.5;
+}
+button {
+  width:100%;
+  min-height:42px;
+  border:0;
+  border-radius:9px;
+  background:var(--accent);
+  color:white;
+  font:inherit;
+  font-size:12px;
+  font-weight:800;
+  cursor:pointer;
+}
+button:disabled { opacity:.45; cursor:not-allowed; }
+button.secondary {
+  margin-top:8px;
+  border:1px solid var(--border);
+  background:var(--panel);
+  color:var(--text);
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:#f6f7f9;
+    --panel:#fff;
+    --text:#17191d;
+    --muted:#687180;
+    --border:#dfe3e8;
+  }
+}
+
+.secondary-grid {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:8px;
+  margin-top:8px;
+}
+.secondary-grid .secondary {
+  margin-top:0;
+}
+
+.hidden { display:none; }
+button.release {
+  margin-top:8px;
+  border:1px solid #6b4d1a;
+  background:#2b2111;
+  color:#f5c96a;
+}
+@media (prefers-color-scheme: light) {
+  button.release {
+    background:#fff8e7;
+    color:#72520d;
+    border-color:#e8d49b;
+  }
+}

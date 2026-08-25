@@ -1,0 +1,10 @@
+{
+  "model_size": "small",
+  "language": "ko",
+  "device": "auto",
+  "compute_type": "auto",
+  "chunk_seconds": 5.0,
+  "overlap_seconds": 1.0,
+  "beam_size": 1,
+  "vad_filter": true
+}

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouTube Live Transcript STT</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">LOCAL WHISPER</p>
+        <h1>Live Transcript</h1>
+      </div>
+      <div class="header-actions">
+        <button id="viewModeBtn" class="view-mode-btn" type="button">새 창으로 분리</button>
+        <span id="statusBadge" class="badge idle">대기</span>
+      </div>
+    </header>
+
+    <section id="notice" class="notice hidden" role="status"></section>
+
+    <section class="server-card">
+      <div>
+        <strong>로컬 STT 서버</strong>
+        <span id="serverState">확인 전</span>
+      </div>
+      <button id="checkServerBtn" type="button">서버 확인</button>
+    </section>
+
+    <section class="video-card">
+      <p id="videoTitle" class="video-title">YouTube 라이브를 열어주세요.</p>
+      <p id="videoMeta" class="video-meta">CC가 없어도 탭 오디오로 인식합니다.</p>
+      <div class="stats">
+        <div><strong id="segmentCount">0</strong><span>구간</span></div>
+        <div><strong id="wordCount">0</strong><span>어절</span></div>
+        <div><strong id="lastTime">00:00:00</strong><span>마지막 위치</span></div>
+      </div>
+    </section>
+
+    <section class="controls">
+      <button id="startBtn" class="primary" type="button">툴바에서 STT 시작</button>
+      <button id="stopBtn" type="button">중지</button>
+      <button id="clearBtn" class="danger-ghost" type="button">초기화</button>
+    </section>
+
+    <label class="toggle-row">
+      <span>
+        <strong>영상 위 STT 오버레이</strong>
+        <small>Whisper가 인식한 최신 문장을 영상 위에 표시</small>
+      </span>
+      <input id="overlayToggle" type="checkbox" role="switch">
+    </label>
+
+    <div class="search-row">
+      <label for="searchInput">자막 검색</label>
+      <input id="searchInput" type="search" placeholder="키워드 입력">
+    </div>
+
+    <section class="transcript-section">
+      <div class="section-heading">
+        <h2>전체 자막</h2>
+        <label class="compact-check">
+          <input id="autoScrollToggle" type="checkbox" checked>
+          자동 스크롤
+        </label>
+      </div>
+      <div id="transcript" class="transcript" aria-live="polite">
+        <p class="empty">STT를 시작하면 약 5초 단위로 전사 결과가 쌓입니다.</p>
+      </div>
+    </section>
+
+    <section class="export-section">
+      <h2>파일 저장</h2>
+      <div class="export-grid">
+        <button data-format="txt" type="button">TXT</button>
+        <button data-format="srt" type="button">SRT</button>
+        <button data-format="vtt" type="button">VTT</button>
+        <button data-format="json" type="button">JSON</button>
+      </div>
+    </section>
+
+    <footer>
+      <span id="viewModeHint">Side Panel 모드</span> · 새 캡처는 Chrome 권한상 툴바 확장 아이콘에서 시작합니다. 음성은 127.0.0.1 로컬 Whisper 서버로만 전송됩니다.
+    </footer>
+  </main>
+  <script src="sidepanel.js"></script>
+</body>
+</html>
