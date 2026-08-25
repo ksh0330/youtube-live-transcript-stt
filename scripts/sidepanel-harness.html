@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><title>Side Panel Visual QA</title></head>
+<body>
+  <script>
+    fetch("../extension/sidepanel.html")
+      .then(response => response.text())
+      .then(html => {
+        const adjusted = html
+          .replace('href="sidepanel.css"', 'href="../extension/sidepanel.css"')
+          .replace(
+            '<script src="transcript-utils.js"><\/script>',
+            '<script src="dev-chrome-mock.js"><\/script><script src="../extension/transcript-utils.js"><\/script>'
+          )
+          .replace('<script src="sidepanel.js"><\/script>', '<script src="../extension/sidepanel.js"><\/script>');
+        document.open();
+        document.write(adjusted);
+        document.close();
+      });
+  </script>
+</body>
+</html>

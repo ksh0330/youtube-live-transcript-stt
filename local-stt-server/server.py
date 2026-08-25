@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -10,24 +12,51 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 
+from streaming import (
+    BoundedAudioBuffer,
+    TranscriptSegment,
+    TranscriptStabilizer,
+    map_model_segments,
+    normalize_text,
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "server_config.json"
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 
+with CONFIG_PATH.open("r", encoding="utf-8") as config_file:
+    CONFIG: dict[str, Any] = json.load(config_file)
+
+DEBUG_LOGGING = bool(CONFIG.get("debug_logging", False))
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if DEBUG_LOGGING else logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
+if not DEBUG_LOGGING:
+    logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+    logging.getLogger("ctranslate2").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 log = logging.getLogger("yt-live-stt")
-
-with CONFIG_PATH.open("r", encoding="utf-8") as f:
-    CONFIG: dict[str, Any] = json.load(f)
 
 MODEL: WhisperModel | None = None
 MODEL_LOCK = asyncio.Lock()
+INFERENCE_LOCK = asyncio.Lock()
 DEVICE_RESOLVED = "unloaded"
 COMPUTE_RESOLVED = "unloaded"
+ACTIVE_CONNECTIONS = 0
+LAST_METRICS: dict[str, float | int] = {}
+
+
+def config_float(
+    name: str, default: float, minimum: float, maximum: float
+) -> float:
+    try:
+        value = float(CONFIG.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def _resolve_device() -> tuple[str, str]:
@@ -41,6 +70,7 @@ def _resolve_device() -> tuple[str, str]:
 
     try:
         import ctranslate2
+
         if ctranslate2.get_cuda_device_count() > 0:
             return "cuda", "float16"
     except Exception:
@@ -49,12 +79,7 @@ def _resolve_device() -> tuple[str, str]:
 
 
 def _probe_model_inference(model: WhisperModel) -> None:
-    """Force one tiny inference pass.
-
-    CTranslate2 can construct a CUDA model successfully even when CUDA runtime
-    DLLs (for example cublas64_12.dll/cudnn64_9.dll) are missing. Those errors
-    are often raised only when the first encoder inference actually runs.
-    """
+    """Force a real encoder pass so missing CUDA runtime DLLs fail early."""
     probe = np.zeros(SAMPLE_RATE, dtype=np.float32)
     segments, _info = model.transcribe(
         probe,
@@ -65,7 +90,6 @@ def _probe_model_inference(model: WhisperModel) -> None:
         temperature=0.0,
         word_timestamps=False,
     )
-    # faster-whisper returns a lazy generator; consuming it triggers inference.
     list(segments)
 
 
@@ -79,22 +103,20 @@ def _load_model_sync() -> WhisperModel:
     if device == "cuda":
         try:
             gpu_model = WhisperModel(model_size, device="cuda", compute_type=compute)
-            log.info("CUDA model constructed; running real inference preflight...")
             _probe_model_inference(gpu_model)
             DEVICE_RESOLVED, COMPUTE_RESOLVED = "cuda", compute
-            log.info("CUDA inference preflight passed.")
+            log.info("Whisper model ready: %s / cuda / %s", model_size, compute)
             return gpu_model
         except Exception as cuda_error:
             log.warning(
-                "CUDA inference unavailable (%s). Falling back automatically to CPU int8.",
+                "CUDA inference unavailable (%s). Falling back to CPU int8.",
                 cuda_error,
             )
 
     cpu_model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    log.info("CPU model constructed; running inference preflight...")
     _probe_model_inference(cpu_model)
     DEVICE_RESOLVED, COMPUTE_RESOLVED = "cpu", "int8"
-    log.info("CPU inference preflight passed.")
+    log.info("Whisper model ready: %s / cpu / int8", model_size)
     return cpu_model
 
 
@@ -111,69 +133,253 @@ async def get_model() -> WhisperModel:
 def pcm16_to_float32(raw: bytes) -> np.ndarray:
     if not raw:
         return np.zeros((0,), dtype=np.float32)
-    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    usable = len(raw) - (len(raw) % BYTES_PER_SAMPLE)
+    if usable <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    samples = np.frombuffer(raw[:usable], dtype="<i2").astype(np.float32)
     return samples / 32768.0
 
 
-def normalize_text(text: str) -> str:
-    return " ".join(str(text or "").replace("\u200b", "").split()).strip()
+def build_initial_prompt(client_prompt: str = "") -> str | None:
+    default_prompt = normalize_text(str(CONFIG.get("initial_prompt", "")))
+    client = normalize_text(client_prompt)[:1000]
+    if not bool(CONFIG.get("allow_client_prompt", True)):
+        client = ""
+    combined = normalize_text(f"{default_prompt} {client}")
+    return combined or None
 
 
-def longest_token_overlap(history: str, incoming: str, max_tokens: int = 14) -> int:
-    h = normalize_text(history).split()
-    n = normalize_text(incoming).split()
-    limit = min(max_tokens, len(h), len(n))
-    for size in range(limit, 0, -1):
-        if h[-size:] == n[:size]:
-            return size
-    return 0
-
-
-def longest_char_overlap(history: str, incoming: str, max_chars: int = 80) -> int:
-    h = normalize_text(history)
-    n = normalize_text(incoming)
-    limit = min(max_chars, len(h), len(n))
-    for size in range(limit, 3, -1):
-        if h[-size:] == n[:size]:
-            return size
-    return 0
-
-
-def dedupe_overlap(history: str, incoming: str) -> str:
-    incoming = normalize_text(incoming)
-    if not incoming:
-        return ""
-
-    token_overlap = longest_token_overlap(history, incoming)
-    if token_overlap:
-        tokens = incoming.split()
-        return normalize_text(" ".join(tokens[token_overlap:]))
-
-    char_overlap = longest_char_overlap(history, incoming)
-    if char_overlap:
-        return normalize_text(incoming[char_overlap:])
-
-    return incoming
-
-
-def transcribe_sync(model: WhisperModel, audio: np.ndarray, language: str) -> str:
+def transcribe_sync(
+    model: WhisperModel,
+    audio: np.ndarray,
+    language: str,
+    initial_prompt: str | None,
+) -> list[TranscriptSegment]:
     if audio.size == 0:
-        return ""
+        return []
 
+    vad_parameters = {
+        "threshold": config_float("vad_threshold", 0.5, 0.0, 1.0),
+        "min_speech_duration_ms": int(
+            config_float("vad_min_speech_duration_ms", 250, 0, 5000)
+        ),
+        "min_silence_duration_ms": int(
+            config_float("vad_min_silence_duration_ms", 500, 100, 5000)
+        ),
+        "speech_pad_ms": int(config_float("vad_speech_pad_ms", 300, 0, 2000)),
+    }
     segments, _info = model.transcribe(
         audio,
         language=language or None,
         beam_size=int(CONFIG.get("beam_size", 1)),
         vad_filter=bool(CONFIG.get("vad_filter", True)),
-        vad_parameters={"min_silence_duration_ms": 300},
+        vad_parameters=vad_parameters,
         condition_on_previous_text=False,
+        initial_prompt=initial_prompt,
         temperature=0.0,
-        word_timestamps=False,
+        word_timestamps=bool(CONFIG.get("word_timestamps", False)),
+        no_speech_threshold=config_float("no_speech_threshold", 0.6, 0.0, 1.0),
+        log_prob_threshold=config_float("log_prob_threshold", -1.0, -5.0, 0.0),
+        compression_ratio_threshold=config_float(
+            "compression_ratio_threshold", 2.4, 1.0, 10.0
+        ),
+        hallucination_silence_threshold=(
+            config_float("hallucination_silence_threshold", 2.0, 0.1, 10.0)
+            if CONFIG.get("hallucination_silence_threshold") is not None
+            else None
+        ),
     )
-    return normalize_text(" ".join(seg.text.strip() for seg in segments if seg.text.strip()))
+    # Segment timestamps are relative to the supplied rolling audio window.
+    return map_model_segments(list(segments), 0.0)
 
 
-app = FastAPI(title="YouTube Live Local STT", version="0.2.0")
+async def receive_audio(
+    websocket: WebSocket,
+    audio_buffer: BoundedAudioBuffer,
+    client_config: dict[str, str],
+    graceful_stop: asyncio.Event,
+) -> None:
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+
+            text_message = message.get("text")
+            if text_message:
+                try:
+                    data = json.loads(text_message)
+                except (TypeError, ValueError):
+                    continue
+                if data.get("type") == "config":
+                    if data.get("language"):
+                        client_config["language"] = str(data["language"])
+                    client_config["initial_prompt"] = str(
+                        data.get("initial_prompt") or ""
+                    )
+                elif data.get("type") == "stop":
+                    graceful_stop.set()
+                    audio_buffer.keep_latest(
+                        config_float("chunk_seconds", 4.0, 2.0, 10.0)
+                    )
+                    return
+                continue
+
+            raw = message.get("bytes")
+            if raw:
+                audio_buffer.append(raw)
+    except WebSocketDisconnect:
+        return
+    finally:
+        audio_buffer.close()
+
+
+async def websocket_send_json(websocket: WebSocket, payload: dict[str, Any]) -> bool:
+    try:
+        await websocket.send_json(payload)
+        return True
+    except Exception:
+        return False
+
+
+async def process_audio(
+    websocket: WebSocket,
+    model: WhisperModel,
+    audio_buffer: BoundedAudioBuffer,
+    client_config: dict[str, str],
+    graceful_stop: asyncio.Event,
+) -> None:
+    global LAST_METRICS
+
+    chunk_seconds = config_float("chunk_seconds", 4.0, 2.0, 10.0)
+    overlap_seconds = min(
+        config_float("overlap_seconds", 2.0, 0.0, 5.0), chunk_seconds
+    )
+    horizon_seconds = min(
+        config_float("commit_horizon_seconds", 2.0, 0.5, 4.0),
+        max(0.5, overlap_seconds or chunk_seconds),
+    )
+    minimum_flush_seconds = config_float("minimum_flush_seconds", 1.0, 0.25, 3.0)
+    chunk_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * chunk_seconds)
+    overlap_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * overlap_seconds)
+    minimum_flush_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * minimum_flush_seconds)
+
+    stabilizer = TranscriptStabilizer(horizon_seconds)
+    overlap_tail = b""
+    previous_new_end_sample: int | None = None
+    sequence = 0
+    latest_audio_end = 0.0
+
+    async def process_chunk(raw: bytes, start_sample: int) -> bool:
+        nonlocal overlap_tail, previous_new_end_sample, sequence, latest_audio_end
+
+        sample_count = len(raw) // BYTES_PER_SAMPLE
+        contiguous = previous_new_end_sample is None or start_sample == previous_new_end_sample
+        if not contiguous:
+            overlap_tail = b""
+            log.warning(
+                "Audio backlog overflow: skipped %.2fs to preserve live position.",
+                max(0.0, (start_sample - (previous_new_end_sample or 0)) / SAMPLE_RATE),
+            )
+
+        window = overlap_tail + raw
+        window_start_sample = start_sample - len(overlap_tail) // BYTES_PER_SAMPLE
+        window_start = window_start_sample / SAMPLE_RATE
+        latest_audio_end = (start_sample + sample_count) / SAMPLE_RATE
+        previous_new_end_sample = start_sample + sample_count
+        overlap_tail = raw[-overlap_bytes:] if overlap_bytes > 0 else b""
+
+        audio = pcm16_to_float32(window)
+        started = time.perf_counter()
+        async with INFERENCE_LOCK:
+            relative_segments = await asyncio.to_thread(
+                transcribe_sync,
+                model,
+                audio,
+                client_config.get("language", str(CONFIG.get("language", "ko"))),
+                build_initial_prompt(client_config.get("initial_prompt", "")),
+            )
+        inference_ms = (time.perf_counter() - started) * 1000
+        absolute_segments = [
+            TranscriptSegment(
+                window_start + item.start,
+                window_start + item.end,
+                item.text,
+            )
+            for item in relative_segments
+        ]
+        finalized, provisional = stabilizer.update(
+            absolute_segments,
+            window_start=window_start,
+            audio_end=latest_audio_end,
+        )
+        sequence += 1
+        LAST_METRICS = {
+            "sequence": sequence,
+            "inference_ms": round(inference_ms, 1),
+            "queue_seconds": round(audio_buffer.seconds, 3),
+            "dropped_seconds": round(audio_buffer.dropped_seconds, 3),
+            "audio_end": round(latest_audio_end, 3),
+        }
+        if DEBUG_LOGGING:
+            log.debug(
+                "window=%0.2f-%0.2f inference=%0.0fms queue=%0.2fs final=%d provisional=%d",
+                window_start,
+                latest_audio_end,
+                inference_ms,
+                audio_buffer.seconds,
+                len(finalized),
+                len(provisional),
+            )
+        return await websocket_send_json(
+            websocket,
+            {
+                "type": "transcript_update",
+                "sequence": sequence,
+                "finalized": [item.as_dict() for item in finalized],
+                "provisional": [item.as_dict() for item in provisional],
+                "new_seconds": round(sample_count / SAMPLE_RATE, 3),
+                "window_seconds": round(len(window) / BYTES_PER_SAMPLE / SAMPLE_RATE, 3),
+                **LAST_METRICS,
+            },
+        )
+
+    while True:
+        item = await audio_buffer.pop(chunk_bytes)
+        if item is None:
+            break
+        raw, start_sample = item
+        if not await process_chunk(raw, start_sample):
+            return
+
+    remaining = audio_buffer.pop_remaining(minimum_flush_bytes)
+    if remaining and graceful_stop.is_set():
+        raw, start_sample = remaining
+        if not await process_chunk(raw, start_sample):
+            return
+
+    flushed = stabilizer.flush()
+    if flushed and graceful_stop.is_set():
+        sequence += 1
+        await websocket_send_json(
+            websocket,
+            {
+                "type": "transcript_update",
+                "sequence": sequence,
+                "finalized": [item.as_dict() for item in flushed],
+                "provisional": [],
+                "audio_end": round(latest_audio_end, 3),
+                "inference_ms": 0,
+                "queue_seconds": round(audio_buffer.seconds, 3),
+                "dropped_seconds": round(audio_buffer.dropped_seconds, 3),
+            },
+        )
+
+    if graceful_stop.is_set():
+        await websocket_send_json(websocket, {"type": "stop_ack"})
+
+
+app = FastAPI(title="YouTube Live Local STT", version="0.3.0")
 
 
 @app.get("/health")
@@ -188,8 +394,14 @@ async def health() -> dict[str, Any]:
         "compute_type": COMPUTE_RESOLVED,
         "model_loaded": MODEL is not None,
         "automatic_cpu_fallback": True,
-        "chunk_seconds": CONFIG.get("chunk_seconds", 5.0),
-        "overlap_seconds": CONFIG.get("overlap_seconds", 1.0),
+        "chunk_seconds": config_float("chunk_seconds", 4.0, 2.0, 10.0),
+        "overlap_seconds": config_float("overlap_seconds", 2.0, 0.0, 5.0),
+        "commit_horizon_seconds": config_float(
+            "commit_horizon_seconds", 2.0, 0.5, 4.0
+        ),
+        "queue_max_seconds": config_float("queue_max_seconds", 16.0, 4.0, 120.0),
+        "active_connections": ACTIVE_CONNECTIONS,
+        "last_metrics": LAST_METRICS,
     }
 
 
@@ -207,90 +419,60 @@ async def warmup() -> dict[str, Any]:
 
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket) -> None:
+    global ACTIVE_CONNECTIONS
+
     await websocket.accept()
-
-    language = str(CONFIG.get("language", "ko"))
-    chunk_seconds = float(CONFIG.get("chunk_seconds", 5.0))
-    overlap_seconds = float(CONFIG.get("overlap_seconds", 1.0))
-    chunk_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * chunk_seconds)
-    overlap_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * overlap_seconds)
-
-    pending = bytearray()
-    overlap_tail = b""
-    accepted_history = ""
-    sequence = 0
+    ACTIVE_CONNECTIONS += 1
+    audio_buffer = BoundedAudioBuffer(
+        SAMPLE_RATE, config_float("queue_max_seconds", 16.0, 4.0, 120.0)
+    )
+    client_config = {
+        "language": str(CONFIG.get("language", "ko")),
+        "initial_prompt": "",
+    }
+    graceful_stop = asyncio.Event()
+    receiver: asyncio.Task[None] | None = None
 
     try:
         await websocket.send_json({"type": "status", "status": "loading_model"})
         model = await get_model()
-        await websocket.send_json({
-            "type": "status",
-            "status": "ready",
-            "message": f"{CONFIG.get('model_size','small')} / {DEVICE_RESOLVED} / {COMPUTE_RESOLVED}",
-        })
-
-        while True:
-            message = await websocket.receive()
-
-            if message.get("type") == "websocket.disconnect":
-                break
-
-            text_message = message.get("text")
-            if text_message:
-                try:
-                    data = json.loads(text_message)
-                    if data.get("type") == "config" and data.get("language"):
-                        language = str(data["language"])
-                except Exception:
-                    pass
-                continue
-
-            raw = message.get("bytes")
-            if not raw:
-                continue
-
-            pending.extend(raw)
-
-            while len(pending) >= chunk_bytes:
-                new_audio = bytes(pending[:chunk_bytes])
-                del pending[:chunk_bytes]
-
-                window = overlap_tail + new_audio
-                overlap_tail = new_audio[-overlap_bytes:] if overlap_bytes > 0 else b""
-
-                audio = pcm16_to_float32(window)
-                raw_text = await asyncio.to_thread(transcribe_sync, model, audio, language)
-                unique_text = dedupe_overlap(accepted_history[-500:], raw_text)
-
-                if unique_text:
-                    sequence += 1
-                    accepted_history = normalize_text(f"{accepted_history} {unique_text}")[-2000:]
-                    await websocket.send_json({
-                        "type": "transcript",
-                        "sequence": sequence,
-                        "text": unique_text,
-                        "raw": raw_text,
-                        "new_seconds": chunk_seconds,
-                        "window_seconds": chunk_seconds + overlap_seconds,
-                    })
-
+        await websocket.send_json(
+            {
+                "type": "status",
+                "status": "ready",
+                "message": f"{CONFIG.get('model_size','small')} / {DEVICE_RESOLVED} / {COMPUTE_RESOLVED}",
+            }
+        )
+        log.info("STT started")
+        receiver = asyncio.create_task(
+            receive_audio(websocket, audio_buffer, client_config, graceful_stop)
+        )
+        await process_audio(
+            websocket, model, audio_buffer, client_config, graceful_stop
+        )
+        await receiver
+        log.info("STT stopped")
     except WebSocketDisconnect:
         pass
     except Exception as error:
         log.exception("WebSocket transcription error")
-        try:
-            await websocket.send_json({"type": "error", "message": str(error)})
-        except Exception:
-            pass
+        await websocket_send_json(
+            websocket, {"type": "error", "message": str(error)}
+        )
     finally:
-        try:
+        audio_buffer.close()
+        if receiver and not receiver.done():
+            receiver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await receiver
+        ACTIVE_CONNECTIONS = max(0, ACTIVE_CONNECTIONS - 1)
+        with contextlib.suppress(Exception):
             await websocket.close()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
     import uvicorn
+
     print()
     print("=" * 68)
     print(" YouTube Live Local STT Server")
@@ -299,4 +481,9 @@ if __name__ == "__main__":
     print(" 종료: Ctrl+C")
     print("=" * 68)
     print()
-    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="info")
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8765,
+        log_level="debug" if DEBUG_LOGGING else "warning",
+    )

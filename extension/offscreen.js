@@ -8,27 +8,31 @@
   let silentGain = null;
   let socket = null;
   let running = false;
+  let activeSessionId = null;
+  let stopAckResolver = null;
   let inputRate = 48000;
   const TARGET_RATE = 16000;
 
-  async function reportStatus(status, error = null) {
+  async function reportStatus(status, error = null, sessionId = activeSessionId) {
     try {
       await chrome.runtime.sendMessage({
         type: "YTLT_OFFSCREEN_STATUS",
         target: "background",
         status,
-        error
+        error,
+        sessionId
       });
     } catch (_) {}
   }
 
-  async function reportError(error) {
+  async function reportError(error, sessionId = activeSessionId) {
     const message = String(error?.message || error || "Unknown STT error");
     try {
       await chrome.runtime.sendMessage({
         type: "YTLT_OFFSCREEN_ERROR",
         target: "background",
-        error: message
+        error: message,
+        sessionId
       });
     } catch (_) {}
   }
@@ -64,8 +68,34 @@
     return out;
   }
 
-  async function stopCapture() {
+  async function requestServerFlush() {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        stopAckResolver = null;
+        resolve();
+      };
+      stopAckResolver = finish;
+      try {
+        socket.send(JSON.stringify({ type: "stop" }));
+      } catch (_) {
+        finish();
+        return;
+      }
+      setTimeout(finish, 6000);
+    });
+  }
+
+  async function stopCapture({ flush = true } = {}) {
+    const stoppedSessionId = activeSessionId;
     running = false;
+
+    if (flush) {
+      await requestServerFlush();
+    }
 
     if (processorNode) {
       processorNode.onaudioprocess = null;
@@ -95,10 +125,13 @@
       socket = null;
     }
 
-    await reportStatus("stopped");
+    if (stoppedSessionId !== null) {
+      await reportStatus("stopped", null, stoppedSessionId);
+    }
+    if (activeSessionId === stoppedSessionId) activeSessionId = null;
   }
 
-  function connectWebSocket(wsUrl, language) {
+  function connectWebSocket(wsUrl, language, initialPrompt, sessionId) {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(wsUrl);
       ws.binaryType = "arraybuffer";
@@ -111,8 +144,12 @@
       ws.onopen = () => {
         clearTimeout(timeout);
         socket = ws;
-        ws.send(JSON.stringify({ type: "config", language: language || "ko" }));
-        reportStatus("connected");
+        ws.send(JSON.stringify({
+          type: "config",
+          language: language || "ko",
+          initial_prompt: String(initialPrompt || "").slice(0, 1000)
+        }));
+        reportStatus("connected", null, sessionId);
         resolve(ws);
       };
 
@@ -123,10 +160,10 @@
 
       ws.onclose = (event) => {
         if (running && event.code !== 1000) {
-          reportStatus("disconnected", `STT 서버 연결 종료: ${event.code}`);
+          reportStatus("disconnected", `STT 서버 연결 종료: ${event.code}`, sessionId);
           // Release MediaStream on abnormal STT server disconnect.
           setTimeout(() => {
-            if (running) stopCapture().catch(() => {});
+            if (running) stopCapture({ flush: false }).catch(() => {});
           }, 0);
         }
       };
@@ -135,10 +172,26 @@
         if (typeof event.data !== "string") return;
         try {
           const data = JSON.parse(event.data);
-          if (data.type === "transcript" && data.text) {
+          if (data.type === "transcript_update") {
+            await chrome.runtime.sendMessage({
+              type: "YTLT_OFFSCREEN_TRANSCRIPT_UPDATE",
+              target: "background",
+              sessionId,
+              sequence: data.sequence,
+              finalized: Array.isArray(data.finalized) ? data.finalized : [],
+              provisional: Array.isArray(data.provisional) ? data.provisional : [],
+              audio_end: data.audio_end,
+              inference_ms: data.inference_ms,
+              queue_seconds: data.queue_seconds,
+              dropped_seconds: data.dropped_seconds,
+              new_seconds: data.new_seconds,
+              window_seconds: data.window_seconds
+            });
+          } else if (data.type === "transcript" && data.text) {
             await chrome.runtime.sendMessage({
               type: "YTLT_OFFSCREEN_TRANSCRIPT",
               target: "background",
+              sessionId,
               text: data.text,
               raw: data.raw || data.text,
               sequence: data.sequence,
@@ -146,26 +199,31 @@
               window_seconds: data.window_seconds
             });
           } else if (data.type === "status") {
-            await reportStatus(data.status || "connected", data.message || null);
+            const status = data.status || "connected";
+            await reportStatus(status, status === "error" ? data.message || null : null, sessionId);
           } else if (data.type === "error") {
-            await reportError(data.message || "STT server error");
+            await reportError(data.message || "STT server error", sessionId);
             // A failed inference must not leave Chrome tabCapture alive.
             // Otherwise the next attempt fails with:
             // "Cannot capture a tab with an active stream."
-            await stopCapture();
+            await stopCapture({ flush: false });
+          } else if (data.type === "stop_ack") {
+            stopAckResolver?.();
           }
         } catch (error) {
-          await reportError(error);
+          await reportError(error, sessionId);
         }
       };
     });
   }
 
-  async function startCapture({ streamId, wsUrl, language }) {
-    await stopCapture();
-    await reportStatus("connecting");
+  async function startCapture({ streamId, wsUrl, language, initialPrompt, sessionId }) {
+    await stopCapture({ flush: false });
+    activeSessionId = sessionId || `${Date.now()}`;
+    const currentSessionId = activeSessionId;
+    await reportStatus("connecting", null, currentSessionId);
 
-    const ws = await connectWebSocket(wsUrl, language);
+    const ws = await connectWebSocket(wsUrl, language, initialPrompt, currentSessionId);
 
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -221,13 +279,13 @@
     for (const track of stream.getAudioTracks()) {
       track.addEventListener("ended", () => {
         if (running) {
-          reportError("탭 오디오 캡처가 종료되었습니다.");
-          stopCapture();
+          reportError("탭 오디오 캡처가 종료되었습니다.", currentSessionId);
+          stopCapture({ flush: false });
         }
       }, { once: true });
     }
 
-    await reportStatus("capturing");
+    await reportStatus("capturing", null, currentSessionId);
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -238,14 +296,14 @@
         .then(() => sendResponse({ ok: true }))
         .catch(async (error) => {
           await reportError(error);
-          await stopCapture();
+          await stopCapture({ flush: false });
           sendResponse({ ok: false, error: String(error?.message || error) });
         });
       return true;
     }
 
     if (message.type === "YTLT_OFFSCREEN_STOP") {
-      stopCapture()
+      stopCapture({ flush: true })
         .then(() => sendResponse({ ok: true }))
         .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
       return true;

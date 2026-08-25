@@ -1,4 +1,4 @@
-# YouTube Live Transcript STT v0.2.3
+# YouTube Live Transcript STT v0.3.0
 
 YouTube 라이브에서 **자막(CC)이 제공되지 않아도** 현재 탭의 실제 오디오를 캡처해
 로컬 `faster-whisper`로 실시간 전사하는 Chrome 확장 프로그램입니다.
@@ -15,6 +15,8 @@ Chrome offscreen document
 WebSocket (127.0.0.1:8765)
       ↓
 faster-whisper
+      ↓
+rolling stabilizer (final + provisional)
       ↓
 Chrome Side Panel
       ├─ 실시간 전체 자막
@@ -64,7 +66,7 @@ http://127.0.0.1:8765/health
 3. Chrome 툴바의 **YT Live STT 확장 아이콘** 클릭
 4. 팝업이 Whisper 모델 준비를 확인할 때까지 기다림
 5. **현재 YouTube 탭 STT 시작** 클릭
-6. Side Panel이 자동으로 열리고 약 5초 단위로 전사 결과가 누적됨
+6. Side Panel이 자동으로 열리고 약 4초마다 rolling 전사 결과가 갱신됨
 
 YouTube 자체 CC가 `사용 불가`여도 상관없습니다.
 
@@ -78,21 +80,23 @@ Chrome `tabCapture`로 오디오 스트림을 획득하면 원래 탭의 오디�
 
 ### 전사 지연
 
-기본 설정은 5초 단위 처리입니다.
+기본 설정은 새 오디오 4초에 직전 2초를 붙인 6초 rolling window입니다.
 
 ```json
 {
-  "chunk_seconds": 5.0,
-  "overlap_seconds": 1.0
+  "chunk_seconds": 4.0,
+  "overlap_seconds": 2.0,
+  "commit_horizon_seconds": 2.0,
+  "queue_max_seconds": 16.0
 }
 ```
 
-Whisper 추론시간까지 더해지므로 PC 성능에 따라 실제 화면 반영은 수 초 더 늦을 수 있습니다.
+마지막 약 2초는 provisional로 표시되어 다음 window에서 수정될 수 있습니다. 확정 자막은 commit horizon 뒤에 추가되며, UI의 `STT 지연`에서 현재 밀림을 확인할 수 있습니다.
 
 ### 중복 처리
 
-각 5초 오디오 앞에 직전 1초를 겹쳐서 Whisper에 전달합니다.
-서버가 이전 전사 끝부분과 새 전사 앞부분을 비교해 중복 문구를 제거합니다.
+각 4초 새 오디오 앞에 직전 2초를 겹쳐서 Whisper에 전달합니다.
+서버는 시간 overlap이 있는 경우에만 공백을 무시한 suffix/prefix 비교와 제한된 fuzzy 비교를 적용합니다. 실제로 떨어져서 반복된 발화는 보존합니다.
 
 ## 모델 설정
 
@@ -106,10 +110,16 @@ Whisper 추론시간까지 더해지므로 PC 성능에 따라 실제 화면 반
   "language": "ko",
   "device": "auto",
   "compute_type": "auto",
-  "chunk_seconds": 5.0,
-  "overlap_seconds": 1.0,
+  "chunk_seconds": 4.0,
+  "overlap_seconds": 2.0,
+  "commit_horizon_seconds": 2.0,
+  "queue_max_seconds": 16.0,
   "beam_size": 1,
-  "vad_filter": true
+  "vad_filter": true,
+  "vad_min_silence_duration_ms": 500,
+  "word_timestamps": false,
+  "initial_prompt": "",
+  "debug_logging": false
 }
 ```
 
@@ -146,12 +156,12 @@ Side Panel에서 다음 형식으로 저장할 수 있습니다.
 - VTT
 - JSON
 
-타임코드는 Whisper 자체 timestamp가 아니라 전사 결과가 도착했을 때의
-YouTube `<video>.currentTime`과 5초 chunk 길이를 이용한 근사값입니다.
+타임코드는 capture 시작 시점의 YouTube `<video>.currentTime`에 faster-whisper
+segment timestamp를 더해 계산합니다. SRT/VTT 내보내기에서는 start/end가 단조 증가하도록 검증합니다.
 
 ## 현재 MVP 한계
 
-- 실제 방송에서 화자가 매우 빠르게 바뀌면 5초 chunk 경계에서 문장 품질이 흔들릴 수 있음
+- 매우 빠른 화자 전환이나 큰 배경음에서는 rolling window 경계에서도 문장 품질이 흔들릴 수 있음
 - 배경음악/효과음이 매우 크면 Whisper 오인식 가능
 - 고정밀 자막 편집용 SRT보다는 라이브 기록/검색/요약용에 더 적합
 - 첫 모델 다운로드/로드 시 바로 전사가 시작되지 않고 준비 시간이 필요할 수 있음
@@ -163,6 +173,7 @@ Python 문법:
 
 ```bash
 python -m py_compile local-stt-server/server.py
+python -m unittest discover -s local-stt-server/tests -v
 ```
 
 Chrome JS 문법(Node.js 설치 시):
@@ -172,7 +183,32 @@ node --check extension/background.js
 node --check extension/offscreen.js
 node --check extension/content.js
 node --check extension/sidepanel.js
+node --test extension/tests/transcript-utils.test.js
 ```
+
+장시간/실측 benchmark:
+
+```bash
+python scripts/simulate_long_run.py
+powershell -ExecutionPolicy Bypass -File scripts/generate_fixture.ps1
+python scripts/benchmark_whisper.py benchmark-results/lecture-fixture.wav --model-size small --include-word-timestamps
+python scripts/smoke_websocket.py benchmark-results/lecture-fixture.wav --duration 12
+```
+
+## v0.3.0 변경점 — rolling stabilizer + bounded queue
+
+- `4초 새 오디오 + 2초 overlap + 2초 commit horizon`
+- final/provisional 자막 분리와 stop 시 provisional flush
+- faster-whisper segment timestamp를 capture 절대 timeline에 매핑
+- WebSocket 수신과 추론 분리, 최대 16초 bounded queue와 oldest-drop overload policy
+- Side Panel/독립 창 delta 갱신, 최근 500개 DOM 렌더, 8초 storage checkpoint
+- 실제 STT 지연, queue, dropped audio 지표
+- player 내부 overlay, 상단/중앙/하단·크기·불투명도 설정
+- YouTube SPA 영상 변경 시 기존 세션 안전 중지, overlay 재부착
+- 선택적 사용자 context prompt; 기본 prompt는 hallucination 방지를 위해 비움
+- 상세 로그는 `debug_logging: true`에서만 활성화
+
+전체 감사, benchmark, 테스트 결과는 [AUDIT_REPORT.md](docs/AUDIT_REPORT.md)에 있습니다.
 
 
 ## v0.2.1 변경점 — activeTab / tabCapture 수정

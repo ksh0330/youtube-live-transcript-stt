@@ -36,11 +36,12 @@
         <div><strong id="segmentCount">0</strong><span>구간</span></div>
         <div><strong id="wordCount">0</strong><span>어절</span></div>
         <div><strong id="lastTime">00:00:00</strong><span>마지막 위치</span></div>
+        <div><strong id="liveDelay">—</strong><span>STT 지연</span></div>
       </div>
     </section>
 
     <section class="controls">
-      <button id="startBtn" class="primary" type="button">툴바에서 STT 시작</button>
+      <button id="startBtn" class="primary" type="button">툴바에서 시작</button>
       <button id="stopBtn" type="button">중지</button>
       <button id="clearBtn" class="danger-ghost" type="button">초기화</button>
     </section>
@@ -52,6 +53,40 @@
       </span>
       <input id="overlayToggle" type="checkbox" role="switch">
     </label>
+
+    <details class="settings-card">
+      <summary>오버레이·인식 문맥 설정</summary>
+      <div class="settings-grid">
+        <label>위치
+          <select id="overlayPosition">
+            <option value="top">상단</option>
+            <option value="center">중앙</option>
+            <option value="bottom">하단</option>
+          </select>
+        </label>
+        <label>글자 크기
+          <select id="overlaySize">
+            <option value="small">작게</option>
+            <option value="medium">보통</option>
+            <option value="large">크게</option>
+          </select>
+        </label>
+        <label>배경 불투명도
+          <select id="overlayOpacity">
+            <option value="0.5">50%</option>
+            <option value="0.7">70%</option>
+            <option value="0.8">80%</option>
+            <option value="0.9">90%</option>
+          </select>
+        </label>
+      </div>
+      <label class="prompt-label" for="contextPrompt">선택 문맥 프롬프트</label>
+      <textarea id="contextPrompt" rows="3" maxlength="1000" placeholder="예: 반도체 설계 강의이며 Verilog, FPGA 용어가 포함됩니다."></textarea>
+      <div class="settings-actions">
+        <small id="settingsStatus">다음 STT 시작부터 문맥 프롬프트가 적용됩니다.</small>
+        <button id="saveSettingsBtn" type="button">설정 저장</button>
+      </div>
+    </details>
 
     <div class="search-row">
       <label for="searchInput">자막 검색</label>
@@ -67,7 +102,7 @@
         </label>
       </div>
       <div id="transcript" class="transcript" aria-live="polite">
-        <p class="empty">STT를 시작하면 약 5초 단위로 전사 결과가 쌓입니다.</p>
+        <p class="empty">STT를 시작하면 약 4초마다 rolling 전사 결과가 쌓입니다.</p>
       </div>
     </section>
 
@@ -85,6 +120,7 @@
       <span id="viewModeHint">Side Panel 모드</span> · 새 캡처는 Chrome 권한상 툴바 확장 아이콘에서 시작합니다. 음성은 127.0.0.1 로컬 Whisper 서버로만 전송됩니다.
     </footer>
   </main>
+  <script src="transcript-utils.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 </html>

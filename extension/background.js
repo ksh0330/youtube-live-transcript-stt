@@ -1,50 +1,131 @@
 const OFFSCREEN_PATH = "offscreen.html";
 const STORAGE_KEY = "ytlt:stt:session";
+const CHECKPOINT_DELAY_MS = 8000;
+const DEFAULT_SETTINGS = Object.freeze({
+  overlayPosition: "bottom",
+  overlaySize: "medium",
+  overlayOpacity: 0.8,
+  contextPrompt: ""
+});
 
 let creatingOffscreen = null;
 let session = null;
 let loaded = false;
 let detachedWindowId = null;
+let persistTimer = null;
+let persistDirty = false;
 
-async function loadSession() {
-  if (loaded) return;
-  const saved = await chrome.storage.local.get(STORAGE_KEY);
-  session = saved[STORAGE_KEY] || {
+function normalizedSettings(value = {}) {
+  const positions = new Set(["top", "center", "bottom"]);
+  const sizes = new Set(["small", "medium", "large"]);
+  const opacity = Number(value.overlayOpacity);
+  return {
+    overlayPosition: positions.has(value.overlayPosition) ? value.overlayPosition : DEFAULT_SETTINGS.overlayPosition,
+    overlaySize: sizes.has(value.overlaySize) ? value.overlaySize : DEFAULT_SETTINGS.overlaySize,
+    overlayOpacity: [0.5, 0.7, 0.8, 0.9].includes(opacity) ? opacity : DEFAULT_SETTINGS.overlayOpacity,
+    contextPrompt: String(value.contextPrompt || "").replace(/\s+/g, " ").trim().slice(0, 1000)
+  };
+}
+
+function emptySession(settings = DEFAULT_SETTINGS) {
+  return {
+    sessionId: null,
     recording: false,
     tabId: null,
     startedAt: null,
     stoppedAt: null,
+    timelineOrigin: 0,
     metadata: null,
     segments: [],
+    provisional: [],
+    lastSequence: 0,
+    metrics: {
+      liveDelay: null,
+      inferenceSeconds: null,
+      queueSeconds: 0,
+      droppedSeconds: 0,
+      audioEnd: 0
+    },
     overlayEnabled: false,
+    settings: normalizedSettings(settings),
     serverStatus: "unknown",
     error: null
   };
-
-  // A service-worker/browser restart means the old MediaStream must not be
-  // assumed to still exist.
-  if (session.recording) {
-    session.recording = false;
-    session.stoppedAt = new Date().toISOString();
-    session.error = "브라우저/확장 프로그램 재시작으로 이전 캡처가 중단되었습니다.";
-  }
-  loaded = true;
 }
 
-async function persist() {
+function normalizeSession(saved) {
+  const base = emptySession(saved?.settings);
+  const value = saved && typeof saved === "object" ? saved : {};
+  return {
+    ...base,
+    ...value,
+    segments: Array.isArray(value.segments) ? value.segments : [],
+    provisional: Array.isArray(value.provisional) ? value.provisional : [],
+    metrics: { ...base.metrics, ...(value.metrics || {}) },
+    settings: normalizedSettings(value.settings),
+    overlayEnabled: Boolean(value.overlayEnabled)
+  };
+}
+
+async function loadSession() {
+  if (loaded) return;
+  const saved = await chrome.storage.local.get(STORAGE_KEY);
+  session = normalizeSession(saved[STORAGE_KEY]);
+  let recoveredInterruptedSession = false;
+
+  // A service-worker/browser restart means the previous MediaStream cannot be
+  // trusted. Keep its transcript, but make restart state explicit.
+  if (session.recording) {
+    promoteProvisional();
+    session.recording = false;
+    session.stoppedAt = new Date().toISOString();
+    session.serverStatus = "stopped";
+    session.error = "브라우저/확장 프로그램 재시작으로 이전 캡처가 중단되었습니다.";
+    persistDirty = true;
+    recoveredInterruptedSession = true;
+  }
+  loaded = true;
+  if (recoveredInterruptedSession) schedulePersist();
+}
+
+async function persistNow() {
   await loadSession();
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  persistDirty = false;
   await chrome.storage.local.set({ [STORAGE_KEY]: session });
 }
 
-async function broadcast() {
-  await persist();
+function schedulePersist() {
+  persistDirty = true;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    if (persistDirty) {
+      persistNow()
+        .then(() => sendRuntimeMessage({ type: "YTLT_STATE", target: "ui", state: session }))
+        .catch(console.error);
+    }
+  }, CHECKPOINT_DELAY_MS);
+}
+
+async function sendRuntimeMessage(message) {
   try {
-    await chrome.runtime.sendMessage({
-      type: "YTLT_STATE",
-      target: "ui",
-      state: session
-    });
+    await chrome.runtime.sendMessage(message);
   } catch (_) {}
+}
+
+async function broadcastFull({ persist = true } = {}) {
+  if (persist) await persistNow();
+  else schedulePersist();
+  await sendRuntimeMessage({ type: "YTLT_STATE", target: "ui", state: session });
+}
+
+async function broadcastDelta(delta) {
+  schedulePersist();
+  await sendRuntimeMessage({ type: "YTLT_TRANSCRIPT_DELTA", target: "ui", delta });
 }
 
 async function ensureOffscreen() {
@@ -65,7 +146,6 @@ async function ensureOffscreen() {
     reasons: ["USER_MEDIA"],
     justification: "Capture a user-authorized YouTube tab audio stream and send PCM to the local speech-to-text server."
   });
-
   try {
     await creatingOffscreen;
   } finally {
@@ -83,213 +163,340 @@ async function getPageInfo(tabId) {
   return {
     title: tab.title || "YouTube",
     url: tab.url || "",
-    videoId: null,
+    videoId: videoIdFromUrl(tab.url),
     channel: "",
     currentTime: null,
     paused: null
   };
 }
 
-async function currentVideoTime(tabId) {
-  const info = await getPageInfo(tabId);
-  return Number.isFinite(info?.currentTime) ? info.currentTime : null;
+function videoIdFromUrl(url) {
+  try {
+    const parsed = new URL(url || "");
+    if (parsed.pathname === "/watch") return parsed.searchParams.get("v");
+    if (parsed.pathname.startsWith("/live/")) return parsed.pathname.split("/")[2] || null;
+  } catch (_) {}
+  return null;
+}
+
+function makeSessionId() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function latestOverlayText() {
+  const provisionalText = (session?.provisional || []).map(item => item.text).filter(Boolean).join(" ");
+  if (provisionalText) return provisionalText;
+  return (session?.segments || []).slice(-2).map(item => item.text).filter(Boolean).join(" ");
+}
+
+async function syncOverlay(tabId = session?.tabId) {
+  if (!Number.isInteger(tabId)) return;
+  const enabled = Boolean(session.overlayEnabled && session.tabId === tabId);
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "YTLT_OVERLAY_TEXT",
+      enabled,
+      text: enabled ? latestOverlayText() : "",
+      settings: session.settings
+    });
+  } catch (_) {}
 }
 
 async function startCaptureWithStream(streamId, tabId) {
   await loadSession();
-
   if (!streamId) {
     throw new Error("Chrome 탭 캡처 권한이 없습니다. 툴바의 확장 프로그램 아이콘에서 다시 시작하세요.");
   }
   if (!Number.isInteger(tabId)) {
     throw new Error("캡처할 YouTube 탭을 찾지 못했습니다.");
   }
+  if (session.recording) await stopCapture();
 
-  if (session.recording) {
-    await stopCapture();
-  }
-
-  // The launcher creates the offscreen document before requesting streamId,
-  // but ensure it again in case Chrome disposed the document.
   await ensureOffscreen();
-
   const tab = await chrome.tabs.get(tabId);
   const info = await getPageInfo(tabId);
-
+  const retainedSettings = normalizedSettings(session.settings);
+  const retainedOverlay = Boolean(session.overlayEnabled);
   session = {
+    ...emptySession(retainedSettings),
+    sessionId: makeSessionId(),
     recording: true,
     tabId,
     startedAt: new Date().toISOString(),
-    stoppedAt: null,
+    timelineOrigin: Number.isFinite(info.currentTime) ? Math.max(0, info.currentTime) : 0,
     metadata: {
       title: info.title || tab.title || "YouTube",
       url: info.url || tab.url || "",
       videoId: info.videoId || null,
       channel: info.channel || ""
     },
-    segments: [],
-    overlayEnabled: Boolean(session?.overlayEnabled),
-    serverStatus: "connecting",
-    error: null
+    overlayEnabled: retainedOverlay,
+    serverStatus: "connecting"
   };
-  await broadcast();
+  await broadcastFull();
 
   const response = await chrome.runtime.sendMessage({
     type: "YTLT_OFFSCREEN_START",
     target: "offscreen",
+    sessionId: session.sessionId,
     streamId,
     wsUrl: "ws://127.0.0.1:8765/ws/transcribe",
-    language: "ko"
+    language: "ko",
+    initialPrompt: session.settings.contextPrompt
   });
 
   if (!response?.ok) {
     session.recording = false;
     session.stoppedAt = new Date().toISOString();
     session.error = response?.error || "오디오 캡처 시작 실패";
-    await broadcast();
+    await broadcastFull();
     throw new Error(session.error);
   }
-
+  await syncOverlay();
   return session;
+}
+
+function normalizedIncomingSegment(item, sequence, index) {
+  const origin = Number(session?.timelineOrigin) || 0;
+  const relativeStart = Math.max(0, Number(item?.start) || 0);
+  const relativeEnd = Math.max(relativeStart + 0.05, Number(item?.end) || relativeStart + 0.5);
+  const text = String(item?.text || "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  return {
+    id: `${session.sessionId || "session"}-${sequence}-${index}`,
+    start: origin + relativeStart,
+    end: origin + relativeEnd,
+    text,
+    raw: item?.raw || text,
+    observedAt: new Date().toISOString(),
+    sequence
+  };
+}
+
+function appendFinalized(items, sequence) {
+  const appended = [];
+  for (let index = 0; index < items.length; index++) {
+    const segment = normalizedIncomingSegment(items[index], sequence, index);
+    if (!segment) continue;
+    const last = session.segments.at(-1);
+    if (last && segment.end <= last.end + 0.03) continue;
+    if (last && segment.start < last.end) segment.start = last.end;
+    if (segment.end <= segment.start) segment.end = segment.start + 0.05;
+    session.segments.push(segment);
+    appended.push(segment);
+  }
+  return appended;
+}
+
+function promoteProvisional() {
+  if (!session?.provisional?.length) return [];
+  const promoted = [];
+  for (const item of session.provisional) {
+    const last = session.segments.at(-1);
+    const segment = { ...item, id: `${item.id || Date.now()}-final`, provisional: undefined };
+    if (last && segment.end <= last.end + 0.03) continue;
+    if (last && segment.start < last.end) segment.start = last.end;
+    if (segment.end <= segment.start) segment.end = segment.start + 0.05;
+    session.segments.push(segment);
+    promoted.push(segment);
+  }
+  session.provisional = [];
+  return promoted;
+}
+
+async function appendTranscriptUpdate(message) {
+  await loadSession();
+  if (!session.recording || !session.tabId) return;
+  if (message.sessionId && message.sessionId !== session.sessionId) return;
+  const sequence = Number(message.sequence) || session.lastSequence + 1;
+  if (sequence <= session.lastSequence) return;
+
+  const finalized = appendFinalized(Array.isArray(message.finalized) ? message.finalized : [], sequence);
+  session.provisional = (Array.isArray(message.provisional) ? message.provisional : [])
+    .map((item, index) => normalizedIncomingSegment(item, sequence, `p${index}`))
+    .filter(Boolean)
+    .map(item => ({ ...item, provisional: true }));
+  session.lastSequence = sequence;
+  session.serverStatus = "connected";
+  session.error = null;
+
+  const inferenceSeconds = Math.max(0, Number(message.inference_ms) || 0) / 1000;
+  const queueSeconds = Math.max(0, Number(message.queue_seconds) || 0);
+  const droppedSeconds = Math.max(0, Number(message.dropped_seconds) || 0);
+  const audioEnd = (Number(session.timelineOrigin) || 0) + Math.max(0, Number(message.audio_end) || 0);
+  let liveDelay = inferenceSeconds + queueSeconds;
+  try {
+    const info = await getPageInfo(session.tabId);
+    if (session.metadata?.videoId && info?.videoId && session.metadata.videoId !== info.videoId) {
+      await stopCapture("YouTube 영상이 변경되어 기존 STT 세션을 안전하게 중지했습니다.");
+      return;
+    }
+    const latestFinalEnd = session.segments.at(-1)?.end;
+    if (Number.isFinite(info?.currentTime) && Number.isFinite(latestFinalEnd)) {
+      liveDelay = Math.max(0, info.currentTime - latestFinalEnd);
+    }
+  } catch (_) {}
+
+  session.metrics = {
+    liveDelay,
+    inferenceSeconds,
+    queueSeconds,
+    droppedSeconds,
+    audioEnd
+  };
+  await syncOverlay();
+  await broadcastDelta({
+    sessionId: session.sessionId,
+    sequence,
+    finalized,
+    provisional: session.provisional,
+    metrics: session.metrics,
+    serverStatus: session.serverStatus,
+    error: null
+  });
+}
+
+// Backward-compatible path for a v0.2.x server.
+async function appendLegacyTranscript(message) {
+  await loadSession();
+  if (!session.recording || !session.tabId) return;
+  if (message.sessionId && message.sessionId !== session.sessionId) return;
+  const text = String(message.text || "").replace(/\s+/g, " ").trim();
+  if (!text) return;
+  const info = await getPageInfo(session.tabId);
+  const end = Number.isFinite(info.currentTime)
+    ? Math.max(0, info.currentTime)
+    : (session.segments.at(-1)?.end || 0) + (Number(message.new_seconds) || 5);
+  const start = Math.max(session.segments.at(-1)?.end || 0, end - (Number(message.new_seconds) || 5));
+  const sequence = Number(message.sequence) || session.lastSequence + 1;
+  const segment = {
+    id: `${session.sessionId}-${sequence}`,
+    start,
+    end: Math.max(start + 0.5, end),
+    text,
+    raw: message.raw || text,
+    observedAt: new Date().toISOString(),
+    sequence
+  };
+  session.segments.push(segment);
+  session.lastSequence = sequence;
+  session.serverStatus = "connected";
+  session.provisional = [];
+  await syncOverlay();
+  await broadcastDelta({
+    sessionId: session.sessionId,
+    sequence,
+    finalized: [segment],
+    provisional: [],
+    metrics: session.metrics,
+    serverStatus: session.serverStatus,
+    error: null
+  });
 }
 
 async function stopCapture(reason = null) {
   await loadSession();
   try {
-    await chrome.runtime.sendMessage({
-      type: "YTLT_OFFSCREEN_STOP",
-      target: "offscreen"
-    });
+    await chrome.runtime.sendMessage({ type: "YTLT_OFFSCREEN_STOP", target: "offscreen" });
   } catch (_) {}
-
+  promoteProvisional();
   session.recording = false;
   session.stoppedAt = new Date().toISOString();
+  session.serverStatus = reason ? "error" : "stopped";
   if (reason) session.error = reason;
-  await broadcast();
+  await syncOverlay();
+  await broadcastFull();
   return session;
 }
 
 async function clearSession() {
   await stopCapture();
-  const overlayEnabled = Boolean(session?.overlayEnabled);
-  session = {
-    recording: false,
-    tabId: null,
-    startedAt: null,
-    stoppedAt: null,
-    metadata: null,
-    segments: [],
-    overlayEnabled,
-    serverStatus: "unknown",
-    error: null
-  };
-  await broadcast();
+  const oldTabId = session.tabId;
+  const settings = normalizedSettings(session.settings);
+  const overlayEnabled = Boolean(session.overlayEnabled);
+  session = { ...emptySession(settings), overlayEnabled };
+  if (Number.isInteger(oldTabId)) {
+    try {
+      await chrome.tabs.sendMessage(oldTabId, {
+        type: "YTLT_OVERLAY_TEXT",
+        enabled: false,
+        text: "",
+        settings
+      });
+    } catch (_) {}
+  }
+  await broadcastFull();
   return session;
 }
 
 async function updateOverlay(enabled) {
   await loadSession();
   session.overlayEnabled = Boolean(enabled);
-
-  if (session.tabId) {
-    const latest = session.segments.at(-1)?.text || "";
-    try {
-      await chrome.tabs.sendMessage(session.tabId, {
-        type: "YTLT_OVERLAY_TEXT",
-        enabled: Boolean(enabled),
-        text: enabled ? latest : ""
-      });
-    } catch (_) {}
-  }
-
-  await broadcast();
+  await syncOverlay();
+  await broadcastFull();
   return session;
 }
 
-async function appendTranscript(message) {
+async function updateSettings(patch) {
   await loadSession();
-  if (!session.recording || !session.tabId) return;
-
-  const text = String(message.text || "").replace(/\s+/g, " ").trim();
-  if (!text) return;
-
-  const nowVideo = await currentVideoTime(session.tabId);
-  const newSeconds = Math.max(0.5, Number(message.new_seconds) || 5);
-  const last = session.segments.at(-1);
-
-  let end;
-  if (Number.isFinite(nowVideo)) {
-    end = Math.max(0, nowVideo);
-  } else if (last) {
-    end = last.end + newSeconds;
-  } else {
-    end = newSeconds;
-  }
-
-  let start = Math.max(0, end - newSeconds);
-  if (last && start < last.end - 0.5) {
-    start = Math.max(0, last.end - 0.5);
-  }
-  if (end <= start) end = start + 0.5;
-
-  session.segments.push({
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    start,
-    end,
-    text,
-    observedAt: new Date().toISOString(),
-    raw: message.raw || text,
-    sequence: Number(message.sequence) || session.segments.length + 1
-  });
-
-  session.serverStatus = "connected";
-  session.error = null;
-
-  if (session.overlayEnabled) {
-    try {
-      await chrome.tabs.sendMessage(session.tabId, {
-        type: "YTLT_OVERLAY_TEXT",
-        enabled: true,
-        text
-      });
-    } catch (_) {}
-  }
-
-  await broadcast();
+  session.settings = normalizedSettings({ ...session.settings, ...(patch || {}) });
+  await syncOverlay();
+  await broadcastFull();
+  return session;
 }
-
 
 async function openDetachedWindow() {
   const targetUrl = chrome.runtime.getURL("sidepanel.html?mode=window");
-
   if (detachedWindowId !== null) {
     try {
       const existing = await chrome.windows.get(detachedWindowId);
       if (existing) {
-        await chrome.windows.update(detachedWindowId, {
-          focused: true,
-          state: "normal"
-        });
+        await chrome.windows.update(detachedWindowId, { focused: true, state: "normal" });
         return { windowId: detachedWindowId, reused: true };
       }
     } catch (_) {
       detachedWindowId = null;
     }
   }
-
   const created = await chrome.windows.create({
     url: targetUrl,
     type: "popup",
-    width: 560,
+    width: 620,
     height: 920,
     focused: true
   });
-
   detachedWindowId = created?.id ?? null;
   return { windowId: detachedWindowId, reused: false };
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+async function handleContentReady(message, sender) {
+  await loadSession();
+  const tabId = sender?.tab?.id;
+  if (!Number.isInteger(tabId)) return { ok: false };
+  const info = message.info || await getPageInfo(tabId);
+  if (session.recording && session.tabId === tabId) {
+    const oldVideoId = session.metadata?.videoId;
+    if (message.type === "YTLT_PAGE_CHANGED" && oldVideoId && info?.videoId && oldVideoId !== info.videoId) {
+      await stopCapture("YouTube 영상이 변경되어 기존 STT 세션을 안전하게 중지했습니다.");
+    } else {
+      session.metadata = {
+        ...session.metadata,
+        title: info?.title || session.metadata?.title,
+        channel: info?.channel || session.metadata?.channel,
+        url: info?.url || session.metadata?.url
+      };
+    }
+  }
+  await syncOverlay(tabId);
+  return {
+    ok: true,
+    enabled: Boolean(session.overlayEnabled && session.tabId === tabId),
+    text: session.tabId === tabId ? latestOverlayText() : "",
+    settings: session.settings
+  };
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.target === "offscreen") return;
 
   const run = async () => {
@@ -297,18 +504,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case "YTLT_PREPARE_CAPTURE":
         await loadSession();
         await ensureOffscreen();
-
-        // If the stored app state says we are not recording, proactively stop
-        // any orphaned MediaStream left by a previous failed inference.
         if (!session.recording) {
           try {
-            await chrome.runtime.sendMessage({
-              type: "YTLT_OFFSCREEN_STOP",
-              target: "offscreen"
-            });
+            await chrome.runtime.sendMessage({ type: "YTLT_OFFSCREEN_STOP", target: "offscreen" });
           } catch (_) {}
         }
-
         sendResponse({ ok: true, recording: Boolean(session.recording) });
         return;
 
@@ -319,8 +519,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       case "YTLT_OPEN_DETACHED":
         try {
-          const result = await openDetachedWindow();
-          sendResponse({ ok: true, ...result });
+          sendResponse({ ok: true, ...(await openDetachedWindow()) });
         } catch (error) {
           sendResponse({ ok: false, error: String(error?.message || error) });
         }
@@ -328,22 +527,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       case "YTLT_STT_START_WITH_STREAM":
         try {
-          const state = await startCaptureWithStream(message.streamId, message.tabId);
-          sendResponse({ ok: true, state });
+          sendResponse({ ok: true, state: await startCaptureWithStream(message.streamId, message.tabId) });
         } catch (error) {
-          sendResponse({
-            ok: false,
-            error: String(error?.message || error),
-            state: session
-          });
+          sendResponse({ ok: false, error: String(error?.message || error), state: session });
         }
         return;
 
-      // Side Panel itself cannot reliably acquire a fresh activeTab grant.
       case "YTLT_STT_START":
         sendResponse({
           ok: false,
-          error: "Chrome 보안 정책상 새 오디오 캡처는 툴바의 확장 프로그램 아이콘에서 시작해야 합니다.",
+          error: "새 STT 시작은 Chrome 툴바의 YT Live STT 아이콘에서 실행하세요.",
           state: session
         });
         return;
@@ -355,17 +548,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case "YTLT_FORCE_RELEASE_CAPTURE":
         try {
           await ensureOffscreen();
-          await chrome.runtime.sendMessage({
-            type: "YTLT_OFFSCREEN_STOP",
-            target: "offscreen"
-          });
+          await chrome.runtime.sendMessage({ type: "YTLT_OFFSCREEN_STOP", target: "offscreen" });
         } catch (_) {}
         await loadSession();
+        promoteProvisional();
         session.recording = false;
         session.stoppedAt = new Date().toISOString();
         session.serverStatus = "stopped";
         session.error = null;
-        await broadcast();
+        await broadcastFull();
         sendResponse({ ok: true, state: session });
         return;
 
@@ -377,26 +568,55 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({ ok: true, state: await updateOverlay(message.enabled) });
         return;
 
+      case "YTLT_SET_SETTINGS":
+        sendResponse({ ok: true, state: await updateSettings(message.settings) });
+        return;
+
+      case "YTLT_CONTENT_READY":
+      case "YTLT_PAGE_CHANGED":
+        sendResponse(await handleContentReady(message, sender));
+        return;
+
       case "YTLT_OFFSCREEN_STATUS":
         await loadSession();
+        if (message.sessionId && message.sessionId !== session.sessionId) {
+          sendResponse({ ok: true, ignored: true });
+          return;
+        }
         session.serverStatus = message.status || "unknown";
         if (message.error) session.error = message.error;
-        await broadcast();
+        if (message.status === "disconnected" && session.recording) {
+          promoteProvisional();
+          session.recording = false;
+          session.stoppedAt = new Date().toISOString();
+          session.error = message.error || "STT 서버 연결이 종료되었습니다. 서버를 확인한 뒤 다시 시작하세요.";
+        }
+        await broadcastFull({ persist: message.status === "disconnected" });
+        sendResponse({ ok: true });
+        return;
+
+      case "YTLT_OFFSCREEN_TRANSCRIPT_UPDATE":
+        await appendTranscriptUpdate(message);
         sendResponse({ ok: true });
         return;
 
       case "YTLT_OFFSCREEN_TRANSCRIPT":
-        await appendTranscript(message);
+        await appendLegacyTranscript(message);
         sendResponse({ ok: true });
         return;
 
       case "YTLT_OFFSCREEN_ERROR":
         await loadSession();
+        if (message.sessionId && message.sessionId !== session.sessionId) {
+          sendResponse({ ok: true, ignored: true });
+          return;
+        }
+        promoteProvisional();
         session.recording = false;
         session.stoppedAt = new Date().toISOString();
         session.serverStatus = "error";
         session.error = message.error || "STT 처리 오류";
-        await broadcast();
+        await broadcastFull();
         sendResponse({ ok: true });
         return;
     }
@@ -404,11 +624,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   run().catch((error) => {
     console.error("[YT Live STT] background message error", error);
-    try {
-      sendResponse({ ok: false, error: String(error?.message || error) });
-    } catch (_) {}
+    try { sendResponse({ ok: false, error: String(error?.message || error) }); } catch (_) {}
   });
-
   return true;
 });
 
@@ -419,9 +636,16 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   }
 });
 
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (!changeInfo.url) return;
+  await loadSession();
+  if (!session.recording || session.tabId !== tabId) return;
+  const oldVideoId = session.metadata?.videoId;
+  if (oldVideoId && videoIdFromUrl(changeInfo.url) !== oldVideoId) {
+    await stopCapture("YouTube 영상 또는 페이지가 변경되어 기존 STT 세션을 안전하게 중지했습니다.");
+  }
+});
 
 chrome.windows.onRemoved.addListener((windowId) => {
-  if (windowId === detachedWindowId) {
-    detachedWindowId = null;
-  }
+  if (windowId === detachedWindowId) detachedWindowId = null;
 });
