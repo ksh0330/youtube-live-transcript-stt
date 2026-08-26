@@ -90,8 +90,9 @@
         els.serverState.textContent = `${model} 모델 준비 중…`;
         showNotice("첫 실행이면 Whisper 모델 다운로드가 진행될 수 있습니다. 완료 후 STT를 시작할 수 있습니다.", "server");
         const warm = await fetch("http://127.0.0.1:8765/warmup", { method: "POST", cache: "no-store" });
-        if (!warm.ok) throw new Error(`모델 준비 실패: HTTP ${warm.status}`);
-        data = { ...data, ...(await warm.json()), model_loaded: true };
+        const warmData = await warm.json().catch(() => ({}));
+        if (!warm.ok) throw new Error(warmData.error || `모델 준비 실패: HTTP ${warm.status}`);
+        data = { ...data, ...warmData, model_loaded: true };
       }
       serverOk = Boolean(data.model_loaded);
       const device = data.device_resolved || data.device || "auto";
@@ -99,10 +100,17 @@
       const rolling = data.chunk_seconds ? ` · ${data.chunk_seconds}+${data.overlap_seconds || 0}s` : "";
       els.serverState.textContent = `정상 · ${model} · ${device}${compute ? ` · ${compute}` : ""}${rolling}`;
       hideNotice("server");
-    } catch (_) {
+    } catch (error) {
       serverOk = false;
-      els.serverState.textContent = "연결 안 됨";
-      showNotice("로컬 STT 서버가 실행되지 않았습니다. local-stt-server/start_server.bat를 먼저 실행하세요.", "server");
+      const message = String(error?.message || error);
+      const serverMissing = message.includes("Failed to fetch");
+      els.serverState.textContent = serverMissing ? "연결 안 됨" : "준비 실패";
+      showNotice(
+        serverMissing
+          ? "로컬 STT 서버가 실행되지 않았습니다. local-stt-server/start_server.bat를 먼저 실행하세요."
+          : message,
+        "server"
+      );
     }
     render();
   }

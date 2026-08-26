@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 import unittest
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -63,6 +66,191 @@ class ServerAudioTests(unittest.TestCase):
         self.assertEqual(result[0].end, 4.1)
         self.assertEqual(model.kwargs["initial_prompt"], "prompt")
         self.assertFalse(model.kwargs["word_timestamps"])
+
+
+class FakeBackend:
+    def __init__(self, events: list[str] | None = None, name: str = "model") -> None:
+        self.events = events
+        self.name = name
+        self.unload_calls = 0
+
+    def unload_model(self) -> None:
+        self.unload_calls += 1
+        if self.events is not None:
+            self.events.append(f"unload:{self.name}")
+
+
+class FakeLoadModel(FakeModel):
+    def __init__(self, events: list[str] | None = None, name: str = "model") -> None:
+        super().__init__([])
+        self.model = FakeBackend(events, name)
+
+
+class ModelLoadingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_config = dict(server.CONFIG)
+        self.original_device = server.DEVICE_RESOLVED
+        self.original_compute = server.COMPUTE_RESOLVED
+        self.original_gpu_status = server.GPU_RUNTIME_STATUS
+        server.CONFIG.update({"model_size": "small", "device": "auto", "compute_type": "auto"})
+
+    def tearDown(self) -> None:
+        server.CONFIG.clear()
+        server.CONFIG.update(self.original_config)
+        server.DEVICE_RESOLVED = self.original_device
+        server.COMPUTE_RESOLVED = self.original_compute
+        server.GPU_RUNTIME_STATUS = self.original_gpu_status
+
+    def test_forced_cpu_loads_small_int8_without_cuda_check(self) -> None:
+        created: list[tuple[str, str]] = []
+
+        def create_model(_size: str, *, device: str, compute_type: str):
+            created.append((device, compute_type))
+            return FakeLoadModel()
+
+        with (
+            mock.patch.object(server, "_resolve_device", return_value=("cpu", "int8")),
+            mock.patch.object(server, "_missing_cuda_runtime_dlls") as dll_check,
+            mock.patch.object(server, "WhisperModel", side_effect=create_model),
+            mock.patch.object(server, "_probe_model_inference"),
+        ):
+            model = server._load_model_sync()
+
+        self.assertIsInstance(model, FakeLoadModel)
+        self.assertEqual(created, [("cpu", "int8")])
+        self.assertEqual(server.DEVICE_RESOLVED, "cpu")
+        self.assertEqual(server.COMPUTE_RESOLVED, "int8")
+        dll_check.assert_not_called()
+
+    def test_missing_cuda_dlls_skip_gpu_model_creation(self) -> None:
+        created: list[tuple[str, str]] = []
+
+        def create_model(_size: str, *, device: str, compute_type: str):
+            created.append((device, compute_type))
+            return FakeLoadModel()
+
+        with (
+            mock.patch.object(server, "_resolve_device", return_value=("cuda", "float16")),
+            mock.patch.object(
+                server,
+                "_missing_cuda_runtime_dlls",
+                return_value=("cublas64_12.dll", "cudnn64_9.dll"),
+            ),
+            mock.patch.object(server, "WhisperModel", side_effect=create_model),
+            mock.patch.object(server, "_probe_model_inference"),
+        ):
+            model = server._load_model_sync()
+
+        self.assertIsInstance(model, FakeLoadModel)
+        self.assertEqual(created, [("cpu", "int8")])
+        self.assertEqual(server.DEVICE_RESOLVED, "cpu")
+        self.assertIn("cublas64_12.dll", server.GPU_RUNTIME_STATUS)
+
+    def test_cuda_preflight_failure_unloads_before_cpu_creation(self) -> None:
+        events: list[str] = []
+        models: dict[str, FakeLoadModel] = {}
+
+        def create_model(_size: str, *, device: str, compute_type: str):
+            events.append(f"create:{device}:{compute_type}")
+            model = FakeLoadModel(events, device)
+            models[device] = model
+            return model
+
+        def probe(model: FakeLoadModel) -> None:
+            device = model.model.name
+            events.append(f"probe:{device}")
+            if device == "cuda":
+                raise RuntimeError("CUDA preflight failed")
+
+        with (
+            mock.patch.object(server, "_resolve_device", return_value=("cuda", "float16")),
+            mock.patch.object(server, "_missing_cuda_runtime_dlls", return_value=()),
+            mock.patch.object(server, "WhisperModel", side_effect=create_model),
+            mock.patch.object(server, "_probe_model_inference", side_effect=probe),
+            mock.patch.object(server.gc, "collect") as collect,
+        ):
+            model = server._load_model_sync()
+
+        self.assertIs(model, models["cpu"])
+        self.assertEqual(models["cuda"].model.unload_calls, 1)
+        self.assertLess(events.index("unload:cuda"), events.index("create:cpu:int8"))
+        collect.assert_called_once()
+
+    def test_cpu_fallback_failure_has_clear_memory_error(self) -> None:
+        with (
+            mock.patch.object(server, "_resolve_device", return_value=("cuda", "float16")),
+            mock.patch.object(
+                server,
+                "_missing_cuda_runtime_dlls",
+                return_value=server.CUDA_RUNTIME_DLLS,
+            ),
+            mock.patch.object(
+                server,
+                "WhisperModel",
+                side_effect=RuntimeError("mkl_malloc: failed to allocate memory"),
+            ),
+        ):
+            with self.assertRaises(server.ModelLoadError) as raised:
+                server._load_model_sync()
+
+        message = str(raised.exception)
+        self.assertIn("GPU runtime unavailable", message)
+        self.assertIn("CPU fallback failed: memory allocation error", message)
+
+
+class ModelSingleFlightTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.original_model = server.MODEL
+        self.original_error = server.MODEL_LOAD_ERROR
+        self.original_lock = server.MODEL_LOCK
+        server.MODEL = None
+        server.MODEL_LOAD_ERROR = None
+        server.MODEL_LOCK = asyncio.Lock()
+
+    async def asyncTearDown(self) -> None:
+        server.MODEL = self.original_model
+        server.MODEL_LOAD_ERROR = self.original_error
+        server.MODEL_LOCK = self.original_lock
+
+    async def test_concurrent_requests_share_one_successful_load(self) -> None:
+        loaded = FakeLoadModel()
+
+        def load_once():
+            time.sleep(0.05)
+            return loaded
+
+        with mock.patch.object(server, "_load_model_sync", side_effect=load_once) as load:
+            results = await asyncio.gather(*(server.get_model() for _ in range(5)))
+
+        self.assertTrue(all(result is loaded for result in results))
+        self.assertEqual(load.call_count, 1)
+
+    async def test_failed_load_is_shared_and_not_retried(self) -> None:
+        def fail_once():
+            time.sleep(0.05)
+            raise server.ModelLoadError("CPU fallback failed: memory allocation error")
+
+        with mock.patch.object(server, "_load_model_sync", side_effect=fail_once) as load:
+            results = await asyncio.gather(
+                *(server.get_model() for _ in range(5)), return_exceptions=True
+            )
+            with self.assertRaisesRegex(server.ModelLoadError, "memory allocation"):
+                await server.get_model()
+
+        self.assertTrue(all(isinstance(result, server.ModelLoadError) for result in results))
+        self.assertEqual(load.call_count, 1)
+
+    async def test_warmup_returns_structured_cached_error(self) -> None:
+        server.MODEL_LOAD_ERROR = (
+            "GPU runtime unavailable\n"
+            "CPU fallback failed: memory allocation error"
+        )
+
+        response = await server.warmup()
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(b"GPU runtime unavailable", response.body)
+        self.assertIn(b"CPU fallback failed", response.body)
 
 
 class WebSocketLifecycleTests(unittest.TestCase):

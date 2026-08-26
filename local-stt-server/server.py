@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
+import gc
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -43,10 +46,22 @@ log = logging.getLogger("yt-live-stt")
 MODEL: WhisperModel | None = None
 MODEL_LOCK = asyncio.Lock()
 INFERENCE_LOCK = asyncio.Lock()
+MODEL_LOAD_ERROR: str | None = None
 DEVICE_RESOLVED = "unloaded"
 COMPUTE_RESOLVED = "unloaded"
+GPU_RUNTIME_STATUS = "unchecked"
 ACTIVE_CONNECTIONS = 0
 LAST_METRICS: dict[str, float | int] = {}
+
+CUDA_RUNTIME_DLLS = (
+    "cublas64_12.dll",
+    "cublasLt64_12.dll",
+    "cudnn64_9.dll",
+)
+
+
+class ModelLoadError(RuntimeError):
+    """Stable, user-facing model load failure cached for this server process."""
 
 
 def config_float(
@@ -78,6 +93,53 @@ def _resolve_device() -> tuple[str, str]:
     return "cpu", "int8"
 
 
+def _windows_dll_loadable(name: str) -> bool:
+    """Return whether Windows can load a DLL using its normal search rules."""
+    if sys.platform != "win32":
+        return True
+
+    try:
+        library = ctypes.WinDLL(name)
+    except OSError:
+        return False
+
+    # ctypes does not expose a public close operation. Release this diagnostic
+    # reference immediately instead of retaining CUDA runtime DLLs indefinitely.
+    handle = library._handle
+    if handle:
+        free_library = ctypes.windll.kernel32.FreeLibrary
+        free_library.argtypes = [ctypes.c_void_p]
+        free_library.restype = ctypes.c_int
+        free_library(handle)
+    return True
+
+
+def _missing_cuda_runtime_dlls() -> tuple[str, ...]:
+    if sys.platform != "win32":
+        return ()
+    return tuple(name for name in CUDA_RUNTIME_DLLS if not _windows_dll_loadable(name))
+
+
+def _summarize_model_error(error: BaseException) -> str:
+    message = " ".join(str(error).split())
+    lowered = message.lower()
+    if "mkl_malloc" in lowered or "failed to allocate memory" in lowered:
+        return "memory allocation error"
+    return message or type(error).__name__
+
+
+def _release_model(model: WhisperModel | None) -> None:
+    if model is None:
+        return
+    backend = getattr(model, "model", model)
+    unload_model = getattr(backend, "unload_model", None)
+    if callable(unload_model):
+        try:
+            unload_model()
+        except Exception as error:
+            log.warning("Failed to unload rejected model cleanly: %s", error)
+
+
 def _probe_model_inference(model: WhisperModel) -> None:
     """Force a real encoder pass so missing CUDA runtime DLLs fail early."""
     probe = np.zeros(SAMPLE_RATE, dtype=np.float32)
@@ -94,39 +156,88 @@ def _probe_model_inference(model: WhisperModel) -> None:
 
 
 def _load_model_sync() -> WhisperModel:
-    global DEVICE_RESOLVED, COMPUTE_RESOLVED
+    global DEVICE_RESOLVED, COMPUTE_RESOLVED, GPU_RUNTIME_STATUS
 
     model_size = str(CONFIG.get("model_size", "small"))
     device, compute = _resolve_device()
     log.info("Whisper model loading: model=%s device=%s compute=%s", model_size, device, compute)
 
+    fallback_reason: str | None = None
     if device == "cuda":
-        try:
-            gpu_model = WhisperModel(model_size, device="cuda", compute_type=compute)
-            _probe_model_inference(gpu_model)
-            DEVICE_RESOLVED, COMPUTE_RESOLVED = "cuda", compute
-            log.info("Whisper model ready: %s / cuda / %s", model_size, compute)
-            return gpu_model
-        except Exception as cuda_error:
-            log.warning(
-                "CUDA inference unavailable (%s). Falling back to CPU int8.",
-                cuda_error,
+        missing_dlls = _missing_cuda_runtime_dlls()
+        if missing_dlls:
+            GPU_RUNTIME_STATUS = f"missing: {', '.join(missing_dlls)}"
+            fallback_reason = (
+                "GPU runtime unavailable: missing " + ", ".join(missing_dlls)
             )
+            log.warning(
+                "%s. CUDA model creation skipped; falling back to CPU int8.",
+                fallback_reason,
+            )
+        else:
+            GPU_RUNTIME_STATUS = "available"
+            gpu_model: WhisperModel | None = None
+            try:
+                gpu_model = WhisperModel(
+                    model_size, device="cuda", compute_type=compute
+                )
+                _probe_model_inference(gpu_model)
+                DEVICE_RESOLVED, COMPUTE_RESOLVED = "cuda", compute
+                log.info("Whisper model ready: %s / cuda / %s", model_size, compute)
+                return gpu_model
+            except Exception as cuda_error:
+                fallback_reason = (
+                    "GPU inference unavailable: "
+                    + _summarize_model_error(cuda_error)
+                )
+                log.warning("%s. Falling back to CPU int8.", fallback_reason)
+                _release_model(gpu_model)
+                gpu_model = None
+                gc.collect()
+    else:
+        GPU_RUNTIME_STATUS = "not_requested"
 
-    cpu_model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    _probe_model_inference(cpu_model)
-    DEVICE_RESOLVED, COMPUTE_RESOLVED = "cpu", "int8"
-    log.info("Whisper model ready: %s / cpu / int8", model_size)
-    return cpu_model
+    cpu_model: WhisperModel | None = None
+    try:
+        cpu_model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        _probe_model_inference(cpu_model)
+        DEVICE_RESOLVED, COMPUTE_RESOLVED = "cpu", "int8"
+        log.info("Whisper model ready: %s / cpu / int8", model_size)
+        return cpu_model
+    except Exception as cpu_error:
+        _release_model(cpu_model)
+        cpu_model = None
+        gc.collect()
+        cpu_message = _summarize_model_error(cpu_error)
+        if fallback_reason:
+            raise ModelLoadError(
+                f"{fallback_reason}\nCPU fallback failed: {cpu_message}"
+            ) from None
+        raise ModelLoadError(f"CPU model loading failed: {cpu_message}") from None
 
 
 async def get_model() -> WhisperModel:
-    global MODEL
+    global MODEL, MODEL_LOAD_ERROR, DEVICE_RESOLVED, COMPUTE_RESOLVED
     if MODEL is not None:
         return MODEL
+    if MODEL_LOAD_ERROR is not None:
+        raise ModelLoadError(MODEL_LOAD_ERROR)
     async with MODEL_LOCK:
-        if MODEL is None:
+        if MODEL is not None:
+            return MODEL
+        if MODEL_LOAD_ERROR is not None:
+            raise ModelLoadError(MODEL_LOAD_ERROR)
+        try:
             MODEL = await asyncio.to_thread(_load_model_sync)
+        except Exception as error:
+            MODEL_LOAD_ERROR = (
+                str(error)
+                if isinstance(error, ModelLoadError)
+                else f"Whisper model loading failed: {_summarize_model_error(error)}"
+            )
+            DEVICE_RESOLVED, COMPUTE_RESOLVED = "error", "error"
+            log.error("Whisper model unavailable: %s", MODEL_LOAD_ERROR)
+            raise ModelLoadError(MODEL_LOAD_ERROR) from None
     return MODEL
 
 
@@ -393,6 +504,8 @@ async def health() -> dict[str, Any]:
         "device_resolved": DEVICE_RESOLVED,
         "compute_type": COMPUTE_RESOLVED,
         "model_loaded": MODEL is not None,
+        "model_error": MODEL_LOAD_ERROR,
+        "gpu_runtime_status": GPU_RUNTIME_STATUS,
         "automatic_cpu_fallback": True,
         "chunk_seconds": config_float("chunk_seconds", 4.0, 2.0, 10.0),
         "overlap_seconds": config_float("overlap_seconds", 2.0, 0.0, 5.0),
@@ -406,8 +519,20 @@ async def health() -> dict[str, Any]:
 
 
 @app.post("/warmup")
-async def warmup() -> dict[str, Any]:
-    await get_model()
+async def warmup() -> Any:
+    try:
+        await get_model()
+    except ModelLoadError as error:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "model_loaded": False,
+                "error": str(error),
+            },
+        )
     return {
         "ok": True,
         "model_loaded": True,
@@ -454,6 +579,12 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
         log.info("STT stopped")
     except WebSocketDisconnect:
         pass
+    except ModelLoadError as error:
+        log.error("WebSocket model unavailable: %s", error)
+        await websocket_send_json(
+            websocket,
+            {"type": "error", "status": "model_unavailable", "message": str(error)},
+        )
     except Exception as error:
         log.exception("WebSocket transcription error")
         await websocket_send_json(

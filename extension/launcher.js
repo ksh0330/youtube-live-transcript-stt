@@ -61,8 +61,11 @@
           method: "POST",
           cache: "no-store"
         });
-        if (!warmup.ok) throw new Error(`Whisper 모델 준비 실패: HTTP ${warmup.status}`);
-        data = { ...data, ...(await warmup.json()) };
+        const warmupData = await warmup.json().catch(() => ({}));
+        if (!warmup.ok) {
+          throw new Error(warmupData.error || `Whisper 모델 준비 실패: HTTP ${warmup.status}`);
+        }
+        data = { ...data, ...warmupData };
       }
 
       ready = true;
