@@ -34,6 +34,13 @@ if not exist ".venv\.ytlt_dependencies_installed" (
   echo [2/3] Dependencies already installed.
 )
 
+python -c "from importlib.metadata import version; version('nvidia-cublas-cu12'); version('nvidia-cudnn-cu12')" >nul 2>&1
+if errorlevel 1 (
+  echo [INFO] GPU runtime not installed. Run setup_gpu.bat to enable NVIDIA GPU inference.
+) else (
+  echo [INFO] Optional NVIDIA GPU runtime detected in .venv.
+)
+
 echo [3/3] Starting server...
 echo.
 python server.py

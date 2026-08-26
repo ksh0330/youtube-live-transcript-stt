@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ctypes
 import gc
 import json
 import logging
-import sys
 import time
 from pathlib import Path
 from typing import Any
+
+from cuda_runtime import (
+    CUDA_RUNTIME_DLLS,
+    register_cuda_dll_directories,
+    windows_dll_loadable,
+)
+
+# Must run before importing faster_whisper/ctranslate2. Handles are retained by
+# cuda_runtime so the directories remain active for this Python process.
+CUDA_DLL_DIRECTORIES = register_cuda_dll_directories()
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -53,13 +61,6 @@ GPU_RUNTIME_STATUS = "unchecked"
 ACTIVE_CONNECTIONS = 0
 LAST_METRICS: dict[str, float | int] = {}
 
-CUDA_RUNTIME_DLLS = (
-    "cublas64_12.dll",
-    "cublasLt64_12.dll",
-    "cudnn64_9.dll",
-)
-
-
 class ModelLoadError(RuntimeError):
     """Stable, user-facing model load failure cached for this server process."""
 
@@ -93,31 +94,8 @@ def _resolve_device() -> tuple[str, str]:
     return "cpu", "int8"
 
 
-def _windows_dll_loadable(name: str) -> bool:
-    """Return whether Windows can load a DLL using its normal search rules."""
-    if sys.platform != "win32":
-        return True
-
-    try:
-        library = ctypes.WinDLL(name)
-    except OSError:
-        return False
-
-    # ctypes does not expose a public close operation. Release this diagnostic
-    # reference immediately instead of retaining CUDA runtime DLLs indefinitely.
-    handle = library._handle
-    if handle:
-        free_library = ctypes.windll.kernel32.FreeLibrary
-        free_library.argtypes = [ctypes.c_void_p]
-        free_library.restype = ctypes.c_int
-        free_library(handle)
-    return True
-
-
 def _missing_cuda_runtime_dlls() -> tuple[str, ...]:
-    if sys.platform != "win32":
-        return ()
-    return tuple(name for name in CUDA_RUNTIME_DLLS if not _windows_dll_loadable(name))
+    return tuple(name for name in CUDA_RUNTIME_DLLS if not windows_dll_loadable(name))
 
 
 def _summarize_model_error(error: BaseException) -> str:
@@ -506,6 +484,7 @@ async def health() -> dict[str, Any]:
         "model_loaded": MODEL is not None,
         "model_error": MODEL_LOAD_ERROR,
         "gpu_runtime_status": GPU_RUNTIME_STATUS,
+        "cuda_dll_directories": [str(path) for path in CUDA_DLL_DIRECTORIES],
         "automatic_cpu_fallback": True,
         "chunk_seconds": config_float("chunk_seconds", 4.0, 2.0, 10.0),
         "overlap_seconds": config_float("overlap_seconds", 2.0, 0.0, 5.0),
