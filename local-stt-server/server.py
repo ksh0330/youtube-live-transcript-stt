@@ -888,7 +888,7 @@ async def process_audio_sentence(
     )
 
 
-app = FastAPI(title="YouTube Live Local STT", version="0.4.1")
+app = FastAPI(title="YouTube Live Local STT", version="0.4.2")
 
 
 @app.get("/health")
