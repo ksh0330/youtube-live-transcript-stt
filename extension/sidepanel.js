@@ -97,8 +97,10 @@
       serverOk = Boolean(data.model_loaded);
       const device = data.device_resolved || data.device || "auto";
       const compute = data.compute_type || "";
-      const rolling = data.chunk_seconds ? ` · ${data.chunk_seconds}+${data.overlap_seconds || 0}s` : "";
-      els.serverState.textContent = `정상 · ${model} · ${device}${compute ? ` · ${compute}` : ""}${rolling}`;
+      const mode = data.streaming_mode === "sentence"
+        ? " · 문장 모드"
+        : data.chunk_seconds ? ` · ${data.chunk_seconds}+${data.overlap_seconds || 0}s` : "";
+      els.serverState.textContent = `정상 · ${model} · ${device}${compute ? ` · ${compute}` : ""}${mode}`;
       hideNotice("server");
     } catch (error) {
       serverOk = false;
@@ -131,9 +133,10 @@
     const matchingFinal = query
       ? finalItems.filter(item => String(item.text || "").toLowerCase().includes(query))
       : finalItems;
-    const matchingProvisional = provisionalItems.filter(item =>
-      !query || String(item.text || "").toLowerCase().includes(query)
-    );
+    const current = utils.currentSentence(provisionalItems);
+    const matchingProvisional = current && (!query || current.text.toLowerCase().includes(query))
+      ? [current]
+      : [];
     const visibleFinal = matchingFinal.slice(-MAX_DOM_ITEMS);
     const signature = [
       state?.sessionId,
@@ -146,7 +149,7 @@
     if (signature === renderSignature) return;
 
     if (!visibleFinal.length && !matchingProvisional.length) {
-      els.transcript.innerHTML = `<p class="empty">${query ? "검색 결과가 없습니다." : "STT를 시작하면 약 4초마다 rolling 전사 결과가 쌓입니다."}</p>`;
+      els.transcript.innerHTML = `<p class="empty">${query ? "검색 결과가 없습니다." : "STT를 시작하면 문장 단위로 자막이 쌓입니다."}</p>`;
       renderSignature = signature;
       return;
     }
@@ -160,12 +163,18 @@
         <div class="transcript-text">${highlight(item.text, els.searchInput.value)}</div>
       </article>
     `).join("");
-    const provisionalHtml = matchingProvisional.map(item => `
+    const provisionalHtml = matchingProvisional.map(item => {
+      const stable = item.stableText ? highlight(item.stableText, els.searchInput.value) : "";
+      const unstable = item.unstableText
+        ? `<span class="unstable">${highlight(item.unstableText, els.searchInput.value)}</span>`
+        : "";
+      return `
       <article class="transcript-item provisional">
         <time class="transcript-time">${utils.formatClock(item.start)}</time>
-        <div class="transcript-text"><span class="provisional-label">임시 · 다음 결과에서 수정될 수 있음</span>${highlight(item.text, els.searchInput.value)}</div>
+        <div class="transcript-text"><span class="provisional-label">말하는 중 · 흐린 부분은 바뀔 수 있음</span>${[stable, unstable].filter(Boolean).join(" ")}</div>
       </article>
-    `).join("");
+    `;
+    }).join("");
     els.transcript.innerHTML = `${limitNote}${finalHtml}${provisionalHtml}`;
 
     if (els.autoScrollToggle.checked && !query && !userScrolledUp) {

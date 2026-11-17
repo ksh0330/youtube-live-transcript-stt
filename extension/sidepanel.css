@@ -103,6 +103,7 @@ button.danger-ghost { color:var(--danger); }
 .transcript-item.provisional { border:1px dashed rgba(245,185,66,.45); border-radius:8px; background:rgba(245,185,66,.07); }
 .transcript-item.provisional .transcript-time { color:var(--yellow); }
 .provisional-label { display:block; margin-bottom:2px; color:var(--yellow); font-size:9px; font-weight:800; }
+.transcript-text .unstable { opacity:.55; }
 .render-limit { margin:8px; color:var(--muted); font-size:9px; text-align:center; }
 mark { padding:0 2px; border-radius:2px; background:#6d4f00; color:#fff1b8; }
 .empty { margin:16px 8px; color:var(--muted); font-size:11px; line-height:1.5; }

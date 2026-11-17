@@ -1,3 +1,6 @@
+importScripts("transcript-utils.js");
+const utils = globalThis.YTLTUtils;
+
 const OFFSCREEN_PATH = "offscreen.html";
 const STORAGE_KEY = "ytlt:stt:session";
 const CHECKPOINT_DELAY_MS = 8000;
@@ -184,9 +187,7 @@ function makeSessionId() {
 }
 
 function latestOverlayText() {
-  const provisionalText = (session?.provisional || []).map(item => item.text).filter(Boolean).join(" ");
-  if (provisionalText) return provisionalText;
-  return (session?.segments || []).slice(-2).map(item => item.text).filter(Boolean).join(" ");
+  return utils.overlayText(session?.segments, session?.provisional);
 }
 
 async function syncOverlay(tabId = session?.tabId) {
@@ -269,7 +270,8 @@ function normalizedIncomingSegment(item, sequence, index) {
     text,
     raw: item?.raw || text,
     observedAt: new Date().toISOString(),
-    sequence
+    sequence,
+    ...(item?.stable ? { stable: true } : {})
   };
 }
 
@@ -290,18 +292,7 @@ function appendFinalized(items, sequence) {
 
 function promoteProvisional() {
   if (!session?.provisional?.length) return [];
-  const promoted = [];
-  for (const item of session.provisional) {
-    const last = session.segments.at(-1);
-    const segment = { ...item, id: `${item.id || Date.now()}-final`, provisional: undefined };
-    if (last && segment.end <= last.end + 0.03) continue;
-    if (last && segment.start < last.end) segment.start = last.end;
-    if (segment.end <= segment.start) segment.end = segment.start + 0.05;
-    session.segments.push(segment);
-    promoted.push(segment);
-  }
-  session.provisional = [];
-  return promoted;
+  return utils.promoteProvisional(session);
 }
 
 async function appendTranscriptUpdate(message) {

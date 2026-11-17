@@ -185,7 +185,8 @@
               queue_seconds: data.queue_seconds,
               dropped_seconds: data.dropped_seconds,
               new_seconds: data.new_seconds,
-              window_seconds: data.window_seconds
+              window_seconds: data.window_seconds,
+              mode: data.mode
             });
           } else if (data.type === "transcript" && data.text) {
             await chrome.runtime.sendMessage({

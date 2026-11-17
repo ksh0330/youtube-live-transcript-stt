@@ -121,10 +121,11 @@
       textAlign: "center",
       pointerEvents: "none",
       boxShadow: "0 6px 24px rgba(0,0,0,.30)",
-      whiteSpace: "normal",
+      // Two lines like YouTube CC: the previous sentence, then the current one.
+      whiteSpace: "pre-line",
       display: "-webkit-box",
       WebkitBoxOrient: "vertical",
-      WebkitLineClamp: "3",
+      WebkitLineClamp: "4",
       overflow: "hidden"
     });
     applyPosition(node, player, overlayState.settings.overlayPosition);

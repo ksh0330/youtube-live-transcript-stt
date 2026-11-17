@@ -100,29 +100,69 @@
     return true;
   }
 
+  // The server sends the unfinished sentence as provisional items: words that
+  // will not change (`stable: true`) first, then the still-changing tail.
+  function currentSentence(provisional) {
+    const items = (Array.isArray(provisional) ? provisional : [])
+      .filter(item => String(item?.text || "").trim());
+    if (!items.length) return null;
+    const join = list => list.map(item => String(item.text).trim()).filter(Boolean).join(" ");
+    const stableText = join(items.filter(item => item.stable));
+    const unstableText = join(items.filter(item => !item.stable));
+    return {
+      id: items[0].id,
+      sequence: items[0].sequence,
+      start: Math.max(0, Number(items[0].start) || 0),
+      end: Math.max(...items.map(item => Number(item.end) || 0)),
+      text: [stableText, unstableText].filter(Boolean).join(" "),
+      stableText,
+      unstableText
+    };
+  }
+
+  // Two-line, YouTube-CC-like overlay: the previous sentence above the one
+  // being spoken, when both fit.
+  function overlayText(segments, provisional, maxChars = 70) {
+    const finals = (Array.isArray(segments) ? segments : [])
+      .map(item => String(item?.text || "").trim())
+      .filter(Boolean);
+    const current = currentSentence(provisional)?.text || "";
+    const last = finals.at(-1) || "";
+    if (current) {
+      return last && last.length + current.length <= maxChars ? `${last}\n${current}` : current;
+    }
+    const previous = finals.at(-2) || "";
+    return previous && previous.length + last.length <= maxChars ? `${previous}\n${last}` : last;
+  }
+
   function promoteProvisional(state) {
     if (!state) return [];
     state.segments = Array.isArray(state.segments) ? state.segments : [];
-    const provisional = Array.isArray(state.provisional) ? state.provisional : [];
-    const appended = [];
-    for (const item of provisional) {
-      const last = state.segments.at(-1);
-      if (last && Number(item.end) <= Number(last.end) + 0.03) continue;
-      const segment = { ...item, provisional: undefined };
-      if (last && Number(segment.start) < Number(last.end)) segment.start = Number(last.end);
-      segment.end = Math.max(Number(segment.start) + 0.05, Number(segment.end));
-      state.segments.push(segment);
-      appended.push(segment);
-    }
+    const sentence = currentSentence(state.provisional);
     state.provisional = [];
-    return appended;
+    if (!sentence) return [];
+    const last = state.segments.at(-1);
+    if (last && sentence.end <= Number(last.end) + 0.03) return [];
+    const segment = {
+      id: sentence.id ? `${sentence.id}-final` : undefined,
+      sequence: sentence.sequence,
+      start: last && sentence.start < Number(last.end) ? Number(last.end) : sentence.start,
+      end: sentence.end,
+      text: sentence.text,
+      observedAt: new Date().toISOString()
+    };
+    segment.end = Math.max(segment.start + 0.05, segment.end);
+    state.segments.push(segment);
+    return [segment];
   }
 
   return {
     applyTranscriptDelta,
     buildExport,
     cleanSegments,
+    currentSentence,
     formatClock,
+    overlayText,
     promoteProvisional,
     safeFilename,
     subtitleTime
