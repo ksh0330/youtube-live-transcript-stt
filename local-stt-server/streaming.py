@@ -17,6 +17,10 @@ def comparison_text(text: str) -> str:
     return "".join(char for char in normalized if char.isalnum())
 
 
+MIN_LOOKBACK_MATCH = 5
+LOOKBACK_CHARS = 12
+
+
 def _comparison_prefix_cut(text: str, count: int) -> int:
     """Return the source index after `count` comparable characters."""
     seen = 0
@@ -43,6 +47,13 @@ def overlap_cut(history: str, incoming: str, max_chars: int = 120) -> int:
 
     for size in range(limit, 3, -1):
         if history_comp[-size:] == incoming_comp[:size]:
+            return _comparison_prefix_cut(incoming, size)
+
+    # The next window may re-recognize the tail but drop or change a word at
+    # the very end ("크기를 반드시" -> "크기를 확인해야"). Accept the incoming
+    # prefix when it appears within the last few characters of history.
+    for size in range(min(len(incoming_comp), max_chars), MIN_LOOKBACK_MATCH - 1, -1):
+        if incoming_comp[:size] in history_comp[-(size + LOOKBACK_CHARS):]:
             return _comparison_prefix_cut(incoming, size)
 
     best_history_size = 0

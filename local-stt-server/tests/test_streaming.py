@@ -43,6 +43,16 @@ class TextMergeTests(unittest.TestCase):
             "고정 소수점 체계를 설명합니다",
         )
 
+    def test_reprediction_that_drops_last_word_is_not_repeated(self) -> None:
+        # Real-model case: the next window dropped "반드시" from the tail.
+        self.assertEqual(
+            merge_overlapping_text(
+                "X86과 X64 환경에서는 자료형 크기를 반드시",
+                "자료형 크기를 확인해야 합니다.",
+            ),
+            "X86과 X64 환경에서는 자료형 크기를 반드시 확인해야 합니다.",
+        )
+
     def test_one_character_insertion_in_overlap(self) -> None:
         self.assertEqual(
             merge_overlapping_text(
