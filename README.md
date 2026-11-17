@@ -45,7 +45,7 @@ YouTube 탭 오디오 ─ tabCapture ─▶ offscreen 문서 (16 kHz mono PCM16)
 
 | 항목 | 기본값 | 설명 |
 | --- | --- | --- |
-| `model_size` | `small` | 느리면 `base`, 정확도가 더 필요하면 `medium` |
+| `model_size` | `small` | CPU에서 느리면 `base`, NVIDIA GPU가 있으면 `large-v3-turbo` |
 | `language` | `ko` | 인식 언어 |
 | `device` | `auto` | `auto`는 CUDA를 먼저 시도하고 실패하면 CPU `int8` |
 | `chunk_seconds` / `overlap_seconds` | `4.0` / `2.0` | 새 오디오 길이 / 앞 window와 겹치는 길이 |
@@ -53,12 +53,33 @@ YouTube 탭 오디오 ─ tabCapture ─▶ offscreen 문서 (16 kHz mono PCM16)
 | `queue_max_seconds` | `16.0` | 처리 대기 오디오 상한 |
 | `debug_logging` | `false` | 상세 로그 |
 
+이 PC에서만 바꿀 값은 `local-stt-server/server_config.local.json`에 적으면 됩니다. 기본 설정 위에 덮어쓰고, Git에는 올라가지 않습니다.
+
+### NVIDIA GPU로 더 빠르고 정확하게
+
+1. `start_server.bat`을 한 번 실행한 뒤 `setup_gpu.bat` 실행 (CUDA 런타임을 `.venv`에만 설치하고 실제 추론으로 확인)
+2. `server_config.local.json`에 더 큰 모델을 지정하고 서버 재시작
+
+```json
+{ "model_size": "large-v3-turbo" }
+```
+
+RTX 5060 Ti에서 6초 window 하나를 처리하는 시간(48초 한국어 강의 클립):
+
+| 설정 | 평균 | p95 |
+| --- | ---: | ---: |
+| small / CPU int8 (i7-11700) | 1.85초 | 1.91초 |
+| small / GPU float16 | 0.21초 | 0.26초 |
+| large-v3-turbo / GPU float16 | 0.29초 | 0.56초 |
+
+large-v3-turbo는 "C 언어의 int와 long 자료형, C89와 C99"처럼 영어·숫자 혼합과 띄어쓰기를 small보다 정확하게 인식했습니다. 첫 실행 때 모델(약 1.5GB)을 내려받습니다.
+
 ## 문제 해결
 
 | 증상 | 해결 |
 | --- | --- |
-| GPU를 쓰고 싶음 | `start_server.bat`을 한 번 실행한 뒤 `setup_gpu.bat` 실행 (CUDA 런타임을 `.venv`에만 설치하고 실제 추론으로 확인) |
-| `cublas64_12.dll` 오류 | 자동으로 CPU로 전환됩니다. GPU가 필요하면 위 `setup_gpu.bat` 실행 |
+| 인식이 부정확하거나 `STT 지연`이 계속 큼 | NVIDIA GPU가 있으면 위 GPU 설정. 없으면 `model_size`를 `base`로 낮추거나, 오버레이·인식 문맥 설정에 주제와 고유명사를 적기 |
+| `GPU runtime unavailable` / `cublas64_12.dll` 오류 | 자동으로 CPU로 전환된 상태입니다. GPU를 쓰려면 `setup_gpu.bat` 실행 |
 | `Cannot capture a tab with an active stream` | 팝업의 **남아 있는 캡처 강제 해제** → 다시 시도 |
 | 시작 버튼이 Side Panel에 없음 | Chrome은 Side Panel 클릭으로 탭 캡처 권한을 주지 않아서, 시작은 툴바 팝업에서만 합니다 |
 | 영상을 바꾸면 기록이 멈춤 | 다른 영상의 자막이 섞이지 않도록 의도한 동작입니다 |
@@ -84,7 +105,7 @@ YouTube 탭 오디오 ─ tabCapture ─▶ offscreen 문서 (16 kHz mono PCM16)
 ```bash
 cd local-stt-server
 python -m pip install -r requirements-dev.txt
-python -m unittest discover -s tests -v          # Python 35개
+python -m unittest discover -s tests -v          # Python 37개
 
 cd ..
 node --test extension/tests/transcript-utils.test.js   # Node 5개
