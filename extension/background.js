@@ -186,8 +186,15 @@ function makeSessionId() {
   return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+// Characters per caption line by overlay text size (bigger text, shorter lines).
+const OVERLAY_LINE_CHARS = Object.freeze({ small: 30, medium: 26, large: 22 });
+
 function latestOverlayText() {
-  return utils.overlayText(session?.segments, session?.provisional);
+  const size = session?.settings?.overlaySize;
+  return utils.overlayText(session?.segments, session?.provisional, {
+    lineChars: OVERLAY_LINE_CHARS[size] || OVERLAY_LINE_CHARS.medium,
+    maxLines: 2
+  });
 }
 
 async function syncOverlay(tabId = session?.tabId) {
@@ -322,9 +329,15 @@ async function appendTranscriptUpdate(message) {
       await stopCapture("YouTube 영상이 변경되어 기존 STT 세션을 안전하게 중지했습니다.");
       return;
     }
-    const latestFinalEnd = session.segments.at(-1)?.end;
-    if (Number.isFinite(info?.currentTime) && Number.isFinite(latestFinalEnd)) {
-      liveDelay = Math.max(0, info.currentTime - latestFinalEnd);
+    // Measure against the newest text on screen. In sentence mode a long
+    // sentence is committed only when it ends, so the last final segment
+    // alone would overstate the delay.
+    const latestShownEnd = Math.max(
+      Number(session.segments.at(-1)?.end) || -Infinity,
+      ...session.provisional.map(item => Number(item.end) || -Infinity)
+    );
+    if (Number.isFinite(info?.currentTime) && Number.isFinite(latestShownEnd)) {
+      liveDelay = Math.max(0, info.currentTime - latestShownEnd);
     }
   } catch (_) {}
 
