@@ -48,6 +48,71 @@
     return cleaned;
   }
 
+  // YouTube-CC-like caption layout: short lines (about 26 characters for
+  // Korean) and at most two lines on screen.
+  const CAPTION_LINE_CHARS = 26;
+  const CAPTION_MAX_LINES = 2;
+
+  function greedyLines(words, limit) {
+    const lines = [];
+    let line = "";
+    for (let word of words) {
+      if (line && line.length + 1 + word.length <= limit) {
+        line += ` ${word}`;
+        continue;
+      }
+      if (line) lines.push(line);
+      while (word.length > limit) {
+        lines.push(word.slice(0, limit));
+        word = word.slice(limit);
+      }
+      line = word;
+    }
+    if (line) lines.push(line);
+    return lines;
+  }
+
+  // Wrap at word boundaries into as few lines as the limit allows, then
+  // balance their lengths so a sentence does not end with a one-word orphan
+  // ("…형사 책임을 묻지" / "않는데요.").
+  function wrapCaption(text, lineChars = CAPTION_LINE_CHARS) {
+    const limit = Math.max(4, Number(lineChars) || CAPTION_LINE_CHARS);
+    const words = String(text || "").split(/\s+/).filter(Boolean);
+    const lines = greedyLines(words, limit);
+    if (lines.length < 2) return lines;
+    const total = words.join(" ").length;
+    for (let width = Math.ceil(total / lines.length); width < limit; width++) {
+      const balanced = greedyLines(words, width);
+      if (balanced.length === lines.length) return balanced;
+    }
+    return lines;
+  }
+
+  // Split each sentence into caption cues of at most two short lines, with
+  // time divided by text length (for SRT/VTT).
+  function captionCues(items, lineChars = CAPTION_LINE_CHARS, maxLines = CAPTION_MAX_LINES) {
+    const cues = [];
+    for (const item of items) {
+      const lines = wrapCaption(item.text, lineChars);
+      if (!lines.length) continue;
+      const groups = [];
+      for (let index = 0; index < lines.length; index += maxLines) {
+        groups.push(lines.slice(index, index + maxLines));
+      }
+      const total = groups.reduce((sum, group) => sum + group.join("").length, 0) || 1;
+      let start = Number(item.start);
+      const duration = Math.max(0.05, Number(item.end) - start);
+      groups.forEach((group, index) => {
+        const end = index === groups.length - 1
+          ? Number(item.end)
+          : start + duration * (group.join("").length / total);
+        cues.push({ start, end: Math.max(start + 0.05, end), text: group.join("\n") });
+        start = end;
+      });
+    }
+    return cues;
+  }
+
   function buildExport(state, format) {
     const items = cleanSegments(state?.segments);
     const meta = state?.metadata || {};
@@ -63,14 +128,14 @@
       return {
         ext: "srt",
         mime: "application/x-subrip;charset=utf-8",
-        content: items.map((item, index) => `${index + 1}\n${subtitleTime(item.start)} --> ${subtitleTime(item.end)}\n${item.text}\n`).join("\n")
+        content: captionCues(items).map((item, index) => `${index + 1}\n${subtitleTime(item.start)} --> ${subtitleTime(item.end)}\n${item.text}\n`).join("\n")
       };
     }
     if (format === "vtt") {
       return {
         ext: "vtt",
         mime: "text/vtt;charset=utf-8",
-        content: "WEBVTT\n\n" + items.map(item => `${subtitleTime(item.start, ".")} --> ${subtitleTime(item.end, ".")}\n${item.text}\n`).join("\n")
+        content: "WEBVTT\n\n" + captionCues(items).map(item => `${subtitleTime(item.start, ".")} --> ${subtitleTime(item.end, ".")}\n${item.text}\n`).join("\n")
       };
     }
     return {
@@ -120,19 +185,21 @@
     };
   }
 
-  // Two-line, YouTube-CC-like overlay: the previous sentence above the one
-  // being spoken, when both fit.
-  function overlayText(segments, provisional, maxChars = 70) {
+  // Roll-up captions like YouTube CC: wrap the last finished sentence and
+  // the sentence being spoken into short lines, and show only the newest
+  // two lines. A new sentence always starts on a new line.
+  function overlayText(segments, provisional, options = {}) {
+    const lineChars = Number(options.lineChars) || CAPTION_LINE_CHARS;
+    const maxLines = Number(options.maxLines) || CAPTION_MAX_LINES;
     const finals = (Array.isArray(segments) ? segments : [])
       .map(item => String(item?.text || "").trim())
       .filter(Boolean);
     const current = currentSentence(provisional)?.text || "";
-    const last = finals.at(-1) || "";
-    if (current) {
-      return last && last.length + current.length <= maxChars ? `${last}\n${current}` : current;
-    }
-    const previous = finals.at(-2) || "";
-    return previous && previous.length + last.length <= maxChars ? `${previous}\n${last}` : last;
+    const lines = [
+      ...wrapCaption(finals.at(-1) || "", lineChars),
+      ...wrapCaption(current, lineChars)
+    ];
+    return lines.slice(-maxLines).join("\n");
   }
 
   function promoteProvisional(state) {
@@ -159,12 +226,14 @@
   return {
     applyTranscriptDelta,
     buildExport,
+    captionCues,
     cleanSegments,
     currentSentence,
     formatClock,
     overlayText,
     promoteProvisional,
     safeFilename,
-    subtitleTime
+    subtitleTime,
+    wrapCaption
   };
 });

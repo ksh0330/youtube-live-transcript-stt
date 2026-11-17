@@ -111,8 +111,8 @@
       zIndex: "2147483647",
       width: "max-content",
       maxWidth: "min(960px, 84%)",
-      padding: "10px 15px",
-      borderRadius: "10px",
+      padding: "6px 14px",
+      borderRadius: "6px",
       background: `rgba(0,0,0,${opacity})`,
       color: "#fff",
       fontSize: sizeMap[overlayState.settings.overlaySize] || sizeMap.medium,
@@ -121,11 +121,8 @@
       textAlign: "center",
       pointerEvents: "none",
       boxShadow: "0 6px 24px rgba(0,0,0,.30)",
-      // Two lines like YouTube CC: the previous sentence, then the current one.
+      // Background sends at most two short lines (YouTube-CC-like roll-up).
       whiteSpace: "pre-line",
-      display: "-webkit-box",
-      WebkitBoxOrient: "vertical",
-      WebkitLineClamp: "4",
       overflow: "hidden"
     });
     applyPosition(node, player, overlayState.settings.overlayPosition);

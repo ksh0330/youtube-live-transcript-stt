@@ -7,7 +7,8 @@ const {
   currentSentence,
   overlayText,
   promoteProvisional,
-  safeFilename
+  safeFilename,
+  wrapCaption
 } = require("../transcript-utils.js");
 
 function fixtureState() {
@@ -86,15 +87,50 @@ test("current sentence joins the stable part and the changing tail", () => {
   assert.equal(currentSentence([]), null);
 });
 
-test("overlay shows the previous sentence above the current one when both fit", () => {
-  const segments = [{ text: "첫 문장입니다." }, { text: "두 번째 문장입니다." }];
-  assert.equal(
-    overlayText(segments, [{ text: "세 번째", stable: true }]),
-    "두 번째 문장입니다.\n세 번째"
+test("captions wrap into short, balanced lines at word boundaries", () => {
+  assert.deepEqual(
+    wrapCaption("가방에서 수익금을 인출하기 위한 용도의 대포 체크카드들이 무더기로 나옵니다.", 20),
+    ["가방에서 수익금을 인출하기", "위한 용도의 대포 체크카드들이", "무더기로 나옵니다."]
   );
-  assert.equal(overlayText(segments, []), "첫 문장입니다.\n두 번째 문장입니다.");
-  const long = "가".repeat(65);
-  assert.equal(overlayText(segments, [{ text: long }]), long);
+  // No one-word orphan at the end of a sentence.
+  assert.deepEqual(
+    wrapCaption("다치거나 숨지더라도 형사 책임을 묻지 않는데요.", 20),
+    ["다치거나 숨지더라도 형사", "책임을 묻지 않는데요."]
+  );
+  assert.ok(wrapCaption("가".repeat(45), 20).every(line => line.length <= 20));
+});
+
+test("overlay rolls up like CC and shows only the newest two short lines", () => {
+  const segments = [
+    { text: "첫 문장입니다." },
+    { text: "다치거나 숨지더라도 형사 책임을 묻지 않는데요." }
+  ];
+  // Last line of the previous sentence, then the sentence being spoken.
+  assert.equal(
+    overlayText(segments, [{ text: "이는 일정 요건을 충족", stable: true }], { lineChars: 20 }),
+    "책임을 묻지 않는데요.\n이는 일정 요건을 충족"
+  );
+  // A long current sentence keeps only its newest two lines.
+  const text = overlayText([], [{ text: "가방에서 수익금을 인출하기 위한 용도의 대포 체크카드들이 무더기로 나옵니다." }], { lineChars: 20 });
+  assert.equal(text, "위한 용도의 대포 체크카드들이\n무더기로 나옵니다.");
+  assert.ok(text.split("\n").every(line => line.length <= 20));
+  // With nothing being spoken, the last sentence stays on screen.
+  assert.equal(overlayText(segments, [], { lineChars: 20 }), "다치거나 숨지더라도 형사\n책임을 묻지 않는데요.");
+});
+
+test("SRT splits long sentences into cues of at most two short lines", () => {
+  const state = fixtureState();
+  state.segments = [{
+    start: 0,
+    end: 6,
+    text: "이를 접한 네티즌들은 피해자를 보호하는 게 맞다, 국내 도입이 절실하다며 긍정적인 반응을 보였습니다."
+  }];
+  const srt = buildExport(state, "srt").content;
+  const cues = srt.trim().split(/\n\n/);
+  assert.equal(cues.length, 2);
+  assert.ok(cues.every(cue => cue.split("\n").slice(2).every(line => line.length <= 26)));
+  assert.ok(cues.every(cue => cue.split("\n").slice(2).length <= 2));
+  assert.match(cues[1], /00:00:06,000/);
 });
 
 test("stop promotes stable and changing parts as one sentence", () => {

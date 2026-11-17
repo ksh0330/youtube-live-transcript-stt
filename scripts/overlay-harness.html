@@ -35,20 +35,27 @@
     <div class="fake-controls"></div>
     <video></video>
   </div>
+  <script src="../extension/transcript-utils.js"></script>
   <script>
     let contentListener = null;
     const settings = { overlayPosition:"bottom", overlaySize:"medium", overlayOpacity:0.8 };
+    // Same roll-up caption text the background builds (last sentence + current one).
+    const captionText = YTLTUtils.overlayText(
+      [{ text: "32비트 안에서 정수부와 소수부를 함께 표현할 수 있습니다." }],
+      [{ text: "스케일링 팩터를 사용하면 여덟 번째", stable: true }, { text: "비트 위치를" }],
+      { lineChars: 26, maxLines: 2 }
+    );
     globalThis.chrome = {
       runtime: {
         onMessage: { addListener(listener) { contentListener = listener; } },
         async sendMessage() {
-          return { ok:true, enabled:true, text:"고정 소수점에서는 정수부와 소수부를 함께 표현할 수 있습니다.", settings };
+          return { ok:true, enabled:true, text:captionText, settings };
         }
       }
     };
     document.querySelectorAll("[data-position]").forEach(button => button.addEventListener("click", () => {
       settings.overlayPosition = button.dataset.position;
-      contentListener?.({ type:"YTLT_OVERLAY_TEXT", enabled:true, text:"고정 소수점에서는 정수부와 소수부를 함께 표현할 수 있습니다. 다음 문장은 provisional 상태입니다.", settings }, null, () => {});
+      contentListener?.({ type:"YTLT_OVERLAY_TEXT", enabled:true, text:captionText, settings }, null, () => {});
     }));
     document.getElementById("autohideBtn").addEventListener("click", () => {
       document.getElementById("movie_player").classList.toggle("ytp-autohide");
