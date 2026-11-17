@@ -34,6 +34,7 @@ from streaming import (
     normalize_text,
     words_to_segment,
 )
+from translator import DEFAULT_TRANSLATION_MODEL, SentenceTranslator, needs_translation
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "server_config.json"
@@ -285,16 +286,126 @@ def provisional_payload(
     return items
 
 
+AUTO_LANGUAGE_LOCK_PROBABILITY = 0.8
+
+
+def session_language(client_config: dict[str, Any]) -> str | None:
+    """Language passed to Whisper: the chosen one, or for `auto` the language
+    locked after the first confident detection (None = detect)."""
+    language = str(client_config.get("language") or CONFIG.get("language", "ko")).lower()
+    if language == "auto":
+        return client_config.get("locked_language")
+    return language
+
+
+def remember_detection(client_config: dict[str, Any], detected: dict[str, Any]) -> None:
+    """Lock an auto-detected language for the rest of the session, so short
+    windows of music or names do not flip the language back and forth."""
+    if str(client_config.get("language", "")).lower() != "auto":
+        return
+    if client_config.get("locked_language"):
+        return
+    language = detected.get("language")
+    probability = float(detected.get("probability") or 0.0)
+    if language and probability >= AUTO_LANGUAGE_LOCK_PROBABILITY:
+        client_config["locked_language"] = language
+        log.info("Detected language locked: %s (%.2f)", language, probability)
+
+
+def source_language(client_config: dict[str, Any], detected: dict[str, Any]) -> str | None:
+    return session_language(client_config) or detected.get("language")
+
+
+TRANSLATOR: SentenceTranslator | None = None
+TRANSLATION_ERROR: str | None = None
+
+
+def get_translator() -> SentenceTranslator:
+    global TRANSLATOR
+    if TRANSLATOR is None:
+        TRANSLATOR = SentenceTranslator(
+            str(CONFIG.get("translation_model") or DEFAULT_TRANSLATION_MODEL),
+            device="cuda" if DEVICE_RESOLVED == "cuda" else "cpu",
+        )
+    return TRANSLATOR
+
+
+def preload_translator() -> None:
+    global TRANSLATION_ERROR
+    try:
+        get_translator().preload()
+        TRANSLATION_ERROR = None
+    except Exception as error:
+        TRANSLATION_ERROR = _summarize_model_error(error)
+        log.error("Translation model unavailable, showing original text: %s", error)
+
+
+async def translate_texts(texts: list[str], source: str | None, target: str) -> list[str] | None:
+    """Translated texts, or None when no translation applies, the model is
+    still loading (original text is shown meanwhile), or it failed."""
+    global TRANSLATION_ERROR
+    if not texts or not needs_translation(source, target):
+        return None
+    if not getattr(get_translator(), "ready", True):
+        return None
+    try:
+        async with INFERENCE_LOCK:
+            return await asyncio.to_thread(get_translator().translate, texts, source, target)
+    except Exception as error:
+        if TRANSLATION_ERROR is None:
+            log.error("Translation unavailable, showing original text: %s", error)
+        TRANSLATION_ERROR = _summarize_model_error(error)
+        return None
+
+
+async def localize_update(
+    finalized: list[TranscriptSegment],
+    provisional: list[dict[str, Any]],
+    client_config: dict[str, Any],
+    detected: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Turn sentences into payload dicts, translated when the viewer asked for
+    another language. Translated items keep the source text in `original`."""
+    final_items = [item.as_dict() for item in finalized]
+    target = str(client_config.get("translate_to") or "")
+    source = source_language(client_config, detected)
+    if not target or not needs_translation(source, target):
+        return final_items, provisional
+
+    current_text = " ".join(str(item["text"]) for item in provisional if item.get("text"))
+    texts = [item["text"] for item in final_items] + ([current_text] if current_text else [])
+    translated = await translate_texts(texts, source, target)
+    if translated is None:
+        return final_items, provisional
+
+    for item, text in zip(final_items, translated):
+        item["original"] = item["text"]
+        item["text"] = text
+        item["language"] = source
+    if current_text:
+        provisional = [{
+            "start": provisional[0]["start"],
+            "end": max(float(item["end"]) for item in provisional),
+            "text": translated[-1],
+            "original": current_text,
+            "language": source,
+        }]
+    return final_items, provisional
+
+
 def transcribe_words_sync(
     model: WhisperModel,
     audio: np.ndarray,
-    language: str,
+    language: str | None,
     initial_prompt: str | None,
+    detected: dict[str, Any] | None = None,
 ) -> list[Word]:
     """Transcribe with word timestamps, relative to the start of `audio`."""
     if audio.size == 0:
         return []
-    segments = _run_model(model, audio, language, initial_prompt, word_timestamps=True)
+    segments = _run_model(
+        model, audio, language, initial_prompt, word_timestamps=True, detected=detected
+    )
     words: list[Word] = []
     for segment in segments:
         segment_words = getattr(segment, "words", None)
@@ -313,8 +424,9 @@ def transcribe_words_sync(
 def transcribe_sync(
     model: WhisperModel,
     audio: np.ndarray,
-    language: str,
+    language: str | None,
     initial_prompt: str | None,
+    detected: dict[str, Any] | None = None,
 ) -> list[TranscriptSegment]:
     if audio.size == 0:
         return []
@@ -324,6 +436,7 @@ def transcribe_sync(
         language,
         initial_prompt,
         word_timestamps=bool(CONFIG.get("word_timestamps", False)),
+        detected=detected,
     )
     # Segment timestamps are relative to the supplied rolling audio window.
     return map_model_segments(segments, 0.0)
@@ -332,10 +445,11 @@ def transcribe_sync(
 def _run_model(
     model: WhisperModel,
     audio: np.ndarray,
-    language: str,
+    language: str | None,
     initial_prompt: str | None,
     *,
     word_timestamps: bool,
+    detected: dict[str, Any] | None = None,
 ) -> list[Any]:
     vad_parameters = {
         "threshold": config_float("vad_threshold", 0.5, 0.0, 1.0),
@@ -368,7 +482,11 @@ def _run_model(
             else None
         ),
     )
-    return list(segments)
+    segments = list(segments)
+    if detected is not None:
+        detected["language"] = getattr(_info, "language", None) or language
+        detected["probability"] = getattr(_info, "language_probability", None)
+    return segments
 
 
 async def receive_audio(
@@ -391,10 +509,19 @@ async def receive_audio(
                     continue
                 if data.get("type") == "config":
                     if data.get("language"):
-                        client_config["language"] = str(data["language"])
+                        client_config["language"] = str(data["language"]).lower()
                     client_config["initial_prompt"] = str(
                         data.get("initial_prompt") or ""
                     )
+                    client_config["translate_to"] = str(
+                        data.get("translate_to") or ""
+                    ).lower()
+                    if client_config["translate_to"] and not getattr(
+                        get_translator(), "ready", True
+                    ):
+                        asyncio.get_running_loop().run_in_executor(
+                            None, preload_translator
+                        )
                 elif data.get("type") == "stop":
                     graceful_stop.set()
                     audio_buffer.keep_latest(
@@ -460,6 +587,7 @@ async def process_audio(
     previous_new_end_sample: int | None = None
     sequence = 0
     latest_audio_end = 0.0
+    last_detected: dict[str, Any] = {}
 
     async def process_chunk(raw: bytes, start_sample: int) -> bool:
         nonlocal overlap_tail, previous_new_end_sample, sequence, latest_audio_end
@@ -482,15 +610,20 @@ async def process_audio(
 
         audio = pcm16_to_float32(window)
         started = time.perf_counter()
+        detected: dict[str, Any] = {}
         async with INFERENCE_LOCK:
             relative_segments = await asyncio.to_thread(
                 transcribe_sync,
                 model,
                 audio,
-                client_config.get("language", str(CONFIG.get("language", "ko"))),
+                session_language(client_config),
                 build_initial_prompt(client_config.get("initial_prompt", "")),
+                detected,
             )
         inference_ms = (time.perf_counter() - started) * 1000
+        if relative_segments:
+            remember_detection(client_config, detected)
+            last_detected.update(detected)
         absolute_segments = [
             TranscriptSegment(
                 window_start + item.start,
@@ -527,16 +660,23 @@ async def process_audio(
                 len(finalized),
                 len(provisional),
             )
+        final_items, provisional_items = await localize_update(
+            finalized,
+            provisional_payload(assembler, provisional),
+            client_config,
+            last_detected,
+        )
         return await websocket_send_json(
             websocket,
             {
                 "type": "transcript_update",
                 "sequence": sequence,
-                "finalized": [item.as_dict() for item in finalized],
-                "provisional": provisional_payload(assembler, provisional),
+                "finalized": final_items,
+                "provisional": provisional_items,
                 "new_seconds": round(sample_count / SAMPLE_RATE, 3),
                 "window_seconds": round(len(window) / BYTES_PER_SAMPLE / SAMPLE_RATE, 3),
                 "mode": "rolling",
+                "language": source_language(client_config, last_detected),
                 **LAST_METRICS,
             },
         )
@@ -557,14 +697,18 @@ async def process_audio(
 
     flushed = assembler.add(stabilizer.flush(), audio_end=latest_audio_end)
     flushed += assembler.flush()
+    if graceful_stop.is_set():
+        flushed_items, _ = await localize_update(flushed, [], client_config, last_detected)
+    else:
+        flushed_items = []
     await send_final_flush(
-        websocket, flushed, sequence, latest_audio_end, audio_buffer, graceful_stop
+        websocket, flushed_items, sequence, latest_audio_end, audio_buffer, graceful_stop
     )
 
 
 async def send_final_flush(
     websocket: WebSocket,
-    flushed: list[TranscriptSegment],
+    flushed: list[dict[str, Any]],
     sequence: int,
     audio_end: float,
     audio_buffer: BoundedAudioBuffer,
@@ -578,7 +722,7 @@ async def send_final_flush(
             {
                 "type": "transcript_update",
                 "sequence": sequence + 1,
-                "finalized": [item.as_dict() for item in flushed],
+                "finalized": flushed,
                 "provisional": [],
                 "audio_end": round(audio_end, 3),
                 "inference_ms": 0,
@@ -620,6 +764,7 @@ async def process_audio_sentence(
     previous_end_sample: int | None = None
     sequence = 0
     latest_audio_end = 0.0
+    last_detected: dict[str, Any] = {}
 
     async def process_chunk(raw: bytes, start_sample: int) -> bool:
         nonlocal buffer, buffer_start, previous_end_sample, sequence, latest_audio_end
@@ -639,15 +784,20 @@ async def process_audio_sentence(
         latest_audio_end = previous_end_sample / SAMPLE_RATE
 
         started = time.perf_counter()
+        detected: dict[str, Any] = {}
         async with INFERENCE_LOCK:
             relative_words = await asyncio.to_thread(
                 transcribe_words_sync,
                 model,
                 buffer,
-                client_config.get("language", str(CONFIG.get("language", "ko"))),
+                session_language(client_config),
                 build_initial_prompt(client_config.get("initial_prompt", "")),
+                detected,
             )
         inference_ms = (time.perf_counter() - started) * 1000
+        if relative_words:
+            remember_detection(client_config, detected)
+            last_detected.update(detected)
         words = [
             Word(buffer_start + word.start, buffer_start + word.end, word.text)
             for word in relative_words
@@ -691,18 +841,23 @@ async def process_audio_sentence(
                 committed.text if committed else "",
                 unstable.text if unstable else "",
             )
+        final_items, provisional_items = await localize_update(
+            finalized,
+            provisional_payload(assembler, [unstable] if unstable else []),
+            client_config,
+            last_detected,
+        )
         return await websocket_send_json(
             websocket,
             {
                 "type": "transcript_update",
                 "sequence": sequence,
-                "finalized": [item.as_dict() for item in finalized],
-                "provisional": provisional_payload(
-                    assembler, [unstable] if unstable else []
-                ),
+                "finalized": final_items,
+                "provisional": provisional_items,
                 "new_seconds": round(sample_count / SAMPLE_RATE, 3),
                 "window_seconds": round(buffer.size / SAMPLE_RATE, 3),
                 "mode": "sentence",
+                "language": source_language(client_config, last_detected),
                 **LAST_METRICS,
             },
         )
@@ -722,8 +877,12 @@ async def process_audio_sentence(
     last = words_to_segment(agreement.flush())
     flushed = assembler.add([last] if last else [], audio_end=latest_audio_end)
     flushed += assembler.flush()
+    if graceful_stop.is_set():
+        flushed_items, _ = await localize_update(flushed, [], client_config, last_detected)
+    else:
+        flushed_items = []
     await send_final_flush(
-        websocket, flushed, sequence, latest_audio_end, audio_buffer, graceful_stop
+        websocket, flushed_items, sequence, latest_audio_end, audio_buffer, graceful_stop
     )
 
 
@@ -747,6 +906,8 @@ async def health() -> dict[str, Any]:
         "automatic_cpu_fallback": True,
         "streaming_mode": resolve_streaming_mode(),
         "sentence_chunk_seconds": config_float("sentence_chunk_seconds", 2.0, 0.5, 6.0),
+        "translation_model": str(CONFIG.get("translation_model") or DEFAULT_TRANSLATION_MODEL),
+        "translation_error": TRANSLATION_ERROR,
         "chunk_seconds": config_float("chunk_seconds", 4.0, 2.0, 10.0),
         "overlap_seconds": config_float("overlap_seconds", 2.0, 0.0, 5.0),
         "commit_horizon_seconds": config_float(
@@ -792,9 +953,10 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
     audio_buffer = BoundedAudioBuffer(
         SAMPLE_RATE, config_float("queue_max_seconds", 16.0, 4.0, 120.0)
     )
-    client_config = {
+    client_config: dict[str, Any] = {
         "language": str(CONFIG.get("language", "ko")),
         "initial_prompt": "",
+        "translate_to": "",
     }
     graceful_stop = asyncio.Event()
     receiver: asyncio.Task[None] | None = None
