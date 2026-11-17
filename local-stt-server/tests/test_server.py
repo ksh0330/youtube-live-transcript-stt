@@ -68,6 +68,24 @@ class ServerAudioTests(unittest.TestCase):
         self.assertFalse(model.kwargs["word_timestamps"])
 
 
+class ConfigTests(unittest.TestCase):
+    def test_local_config_overrides_defaults(self) -> None:
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "server_config.json"
+            local = Path(directory) / "server_config.local.json"
+            base.write_text(json.dumps({"model_size": "small", "language": "ko"}), "utf-8")
+            self.assertEqual(server.load_config(base, local)["model_size"], "small")
+
+            # Notepad on Windows may save with a UTF-8 BOM.
+            local.write_text(json.dumps({"model_size": "large-v3-turbo"}), "utf-8-sig")
+            config = server.load_config(base, local)
+            self.assertEqual(config["model_size"], "large-v3-turbo")
+            self.assertEqual(config["language"], "ko")
+
+
 class FakeBackend:
     def __init__(self, events: list[str] | None = None, name: str = "model") -> None:
         self.events = events

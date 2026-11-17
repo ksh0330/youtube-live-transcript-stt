@@ -33,11 +33,24 @@ from streaming import (
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "server_config.json"
+# Optional, git-ignored overrides for this PC (e.g. a GPU model choice).
+LOCAL_CONFIG_PATH = BASE_DIR / "server_config.local.json"
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 
-with CONFIG_PATH.open("r", encoding="utf-8") as config_file:
-    CONFIG: dict[str, Any] = json.load(config_file)
+
+def load_config(
+    path: Path = CONFIG_PATH, local_path: Path = LOCAL_CONFIG_PATH
+) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as config_file:
+        config: dict[str, Any] = json.load(config_file)
+    if local_path.exists():
+        with local_path.open("r", encoding="utf-8-sig") as local_file:
+            config.update(json.load(local_file))
+    return config
+
+
+CONFIG: dict[str, Any] = load_config()
 
 DEBUG_LOGGING = bool(CONFIG.get("debug_logging", False))
 logging.basicConfig(

@@ -3,4 +3,4 @@ local-stt-server/.venv/
 *.py[cod]
 .pytest_cache/
 benchmark-results/
-
+local-stt-server/server_config.local.json
