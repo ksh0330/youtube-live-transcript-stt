@@ -362,12 +362,45 @@ class TranscriptStabilizer:
         for item in sorted(fallback + final_candidates, key=lambda x: (x.start, x.end)):
             self._append_final(item, newly_finalized)
 
-        provisional: list[TranscriptSegment] = []
-        provisional_context = self._final_context
-        provisional_end = self.final_end
+        # A previous provisional segment that starts before this window cannot
+        # be fully re-recognized here (its head audio is not in the window).
+        # Carry it forward instead of replacing it with a tail-only result;
+        # otherwise the start of the sentence is lost, e.g. in the short last
+        # window after stop.
+        carry = [
+            item
+            for item in self._previous_provisional
+            if item.end > horizon
+            and item.end > self.final_end + 0.05
+            and item.start < window_start - 0.25
+        ]
+        used_carry: set[int] = set()
+        provisional_source: list[TranscriptSegment] = []
         for item in current_segments:
             if item.end <= horizon or item.end <= self.final_end + 0.05:
                 continue
+            for index, previous in enumerate(carry):
+                if (
+                    index not in used_carry
+                    and near(previous, item)
+                    and texts_overlap(previous.text, item.text)
+                ):
+                    item = TranscriptSegment(
+                        min(previous.start, item.start),
+                        max(previous.end, item.end),
+                        merge_reprediction(previous.text, item.text),
+                    )
+                    used_carry.add(index)
+                    break
+            provisional_source.append(item)
+        provisional_source += [
+            item for index, item in enumerate(carry) if index not in used_carry
+        ]
+
+        provisional: list[TranscriptSegment] = []
+        provisional_context = self._final_context
+        provisional_end = self.final_end
+        for item in sorted(provisional_source, key=lambda x: (x.start, x.end)):
             timing_overlaps = item.start <= provisional_end + 0.1
             text = (
                 remove_overlap(provisional_context[-500:], item.text)

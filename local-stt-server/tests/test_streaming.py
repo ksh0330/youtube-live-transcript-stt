@@ -199,6 +199,26 @@ class StabilizerTests(unittest.TestCase):
             ["오늘은 자료형을 봅니다", "int와 long 자료형을 비교합니다", "다음으로"],
         )
 
+    def test_short_last_window_keeps_head_of_provisional_sentence(self) -> None:
+        # Real-model case: after stop, the last 2.2 s window only re-recognized
+        # the tail, and the provisional sentence lost its first half.
+        stabilizer = TranscriptStabilizer(commit_horizon_seconds=2.0)
+        stabilizer.update(
+            [TranscriptSegment(42.6, 47.6, "32비트 안에서 정수부와 소수부를 함께 표현할 수 있습니다.")],
+            window_start=42.0,
+            audio_end=48.0,
+        )
+        final, provisional = stabilizer.update(
+            [TranscriptSegment(46.0, 47.44, "표현할 수 있습니다.")],
+            window_start=46.0,
+            audio_end=48.2,
+        )
+        self.assertEqual(final, [])
+        self.assertEqual(
+            [item.text for item in provisional + stabilizer.flush()][-1],
+            "32비트 안에서 정수부와 소수부를 함께 표현할 수 있습니다.",
+        )
+
     def test_new_sentence_near_provisional_is_kept(self) -> None:
         stabilizer = TranscriptStabilizer(commit_horizon_seconds=2.0)
         stabilizer.update(
