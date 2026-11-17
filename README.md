@@ -11,6 +11,7 @@
 - **문장 단위 자막:** 말하는 중인 문장은 한 줄로 이어지고(바뀔 수 있는 끝부분은 흐리게), 문장이 끝나면 확정
 - 영상 위 자막은 YouTube CC처럼 한 줄 26자 안팎의 짧은 두 줄이 위로 밀려 올라감 (SRT/VTT도 같은 규칙으로 저장)
 - NVIDIA GPU에서는 문장 전체를 다시 인식해 확정하는 **문장 모드**로 경계 오인식을 줄임
+- **다른 언어:** 인식 언어를 자동 감지·한국어·영어·일본어·중국어 중에서 고르고, 영어·일본어 등은 **한국어로 번역해서** 보여 줌 (원문은 Side Panel에 작게 함께 표시)
 - Side Panel·독립 창·영상 위 overlay에 같은 세션 표시
 - 자막 검색, TXT / SRT / VTT / JSON 저장
 - NVIDIA GPU가 있으면 CUDA, 없거나 실패하면 CPU로 자동 전환
@@ -49,6 +50,17 @@ YouTube 탭 오디오 ─ tabCapture ─▶ offscreen 문서 (16 kHz mono PCM16)
 - **반복 루프 제거:** 음악·무음에서 Whisper가 같은 문구를 3번 이상 반복하면 하나로 합칩니다.
 - **밀림 방지:** CPU가 실시간보다 느리면 처리 대기 오디오를 최대 16초로 제한하고 가장 오래된 부분부터 버립니다. 버린 시간은 UI에 표시됩니다.
 
+## 다른 언어와 한국어 번역
+
+Side Panel의 **언어·오버레이·인식 문맥 설정**에서 고르고 **설정 저장**을 누르면 다음 STT 시작부터 적용됩니다.
+
+- **인식 언어:** 기본은 `자동 감지`입니다. 처음에 확신도 0.8 이상으로 감지된 언어를 그 세션 동안 고정해서, 음악이나 고유명사 때문에 언어가 왔다 갔다 하지 않습니다.
+- **한국어로 번역해서 보기 (기본 켜짐):** 한국어가 아닌 말은 문장 단위로 한국어로 번역해서 보여 줍니다. Whisper의 자체 번역은 영어로만 되기 때문에, 번역에는 로컬 [NLLB-200](https://huggingface.co/OpenNMT/nllb-200-distilled-1.3B-ct2-int8) 1.3B 모델(CTranslate2 int8)을 따로 씁니다.
+  - 처음 쓸 때 번역 모델(약 1.4GB)을 내려받고, 준비되는 동안에는 원문이 그대로 보입니다.
+  - 문장 하나 번역에 RTX 5060 Ti에서 약 0.2초, CPU(i7-11700)에서 약 0.4초가 걸렸습니다.
+  - 영어는 번역 품질이 좋은 편입니다. 일본어는 일상 문장은 자연스럽지만, 기술 용어는 틀리게 번역할 수 있습니다.
+- 번역된 자막 아래에는 원문이 작게 표시되고, TXT 저장에는 `(원문)` 줄이 함께 들어갑니다. SRT/VTT에는 번역문만 들어갑니다.
+
 ## 설정
 
 `local-stt-server/server_config.json`에서 바꿉니다. 자주 쓰는 항목만 정리했습니다.
@@ -56,9 +68,10 @@ YouTube 탭 오디오 ─ tabCapture ─▶ offscreen 문서 (16 kHz mono PCM16)
 | 항목 | 기본값 | 설명 |
 | --- | --- | --- |
 | `model_size` | `small` | CPU에서 느리면 `base`, NVIDIA GPU가 있으면 `large-v3-turbo` |
-| `language` | `ko` | 인식 언어 |
+| `language` | `ko` | 확장 프로그램이 언어를 보내지 않을 때 쓰는 기본 인식 언어 |
+| `translation_model` | `OpenNMT/nllb-200-distilled-1.3B-ct2-int8` | 번역 모델 (Hugging Face 저장소 이름 또는 로컬 경로) |
 | `streaming_mode` | `auto` | `auto`는 GPU면 `sentence`, CPU면 `rolling` |
-| `sentence_pause_seconds` / `sentence_max_chars` | `0.8` / `60` | 문장을 끊는 쉼 길이 / 한 줄 최대 글자 수 |
+| `sentence_pause_seconds` / `sentence_max_chars` | `0.8` / `60` | 문장을 끊는 쉼 길이 / 문장 최대 길이 (한글 기준, 영어는 약 2배) |
 | `device` | `auto` | `auto`는 CUDA를 먼저 시도하고 실패하면 CPU `int8` |
 | `chunk_seconds` / `overlap_seconds` | `4.0` / `2.0` | 새 오디오 길이 / 앞 window와 겹치는 길이 |
 | `reprediction_tolerance_seconds` | `1.0` | 다시 인식된 같은 문장으로 볼 시간 허용 범위 |
@@ -126,6 +139,7 @@ large-v3-turbo는 "C 언어의 int와 long 자료형, C89와 C99"처럼 영어·
 
 - 빠른 화자 전환, 큰 배경음, 숫자·영어 혼합에서는 인식이 흔들릴 수 있습니다. CPU의 rolling 모드에서는 window 경계에서 문장이 잘린 조각이 남을 수 있습니다.
 - 문장 모드는 말이 쉬지 않고 이어지면 20초마다 강제로 끊어 다시 인식합니다.
+- 번역 모델 NLLB-200은 CC-BY-NC 4.0 라이선스(비상업적 이용)입니다.
 - 정밀한 자막 편집보다 라이브 기록·검색·요약 용도에 맞습니다.
 - 재생 중 seek나 일시정지를 반복하면 타임코드가 영상과 어긋날 수 있습니다.
 - Chrome의 탭 캡처 정책이나 YouTube 페이지 구조가 바뀌면 영향을 받을 수 있습니다.
@@ -135,10 +149,10 @@ large-v3-turbo는 "C 언어의 int와 long 자료형, C89와 C99"처럼 영어·
 ```bash
 cd local-stt-server
 python -m pip install -r requirements-dev.txt
-python -m unittest discover -s tests -v          # Python 48개
+python -m unittest discover -s tests -v          # Python 58개
 
 cd ..
-node --test extension/tests/transcript-utils.test.js   # Node 10개
+node --test extension/tests/transcript-utils.test.js   # Node 11개
 ```
 
 실제 모델로 확인하려면 서버를 켠 뒤 다음을 실행합니다.
