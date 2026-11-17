@@ -92,6 +92,7 @@ large-v3-turbo는 "C 언어의 int와 long 자료형, C89와 C99"처럼 영어·
 | --- | --- |
 | 인식이 부정확하거나 `STT 지연`이 계속 큼 | NVIDIA GPU가 있으면 위 GPU 설정. 없으면 `model_size`를 `base`로 낮추거나, 오버레이·인식 문맥 설정에 주제와 고유명사를 적기 |
 | `GPU runtime unavailable` / `cublas64_12.dll` 오류 | 자동으로 CPU로 전환된 상태입니다. GPU를 쓰려면 `setup_gpu.bat` 실행 |
+| 영상 위 자막만 안 보이고 Side Panel에는 나옴 | YouTube 탭을 새로고침 (v0.4.1부터는 확장 프로그램 업데이트 때 자동으로 다시 연결) |
 | `Cannot capture a tab with an active stream` | 팝업의 **남아 있는 캡처 강제 해제** → 다시 시도 |
 | 시작 버튼이 Side Panel에 없음 | Chrome은 Side Panel 클릭으로 탭 캡처 권한을 주지 않아서, 시작은 툴바 팝업에서만 합니다 |
 | 영상을 바꾸면 기록이 멈춤 | 다른 영상의 자막이 섞이지 않도록 의도한 동작입니다 |
