@@ -25,10 +25,14 @@ from faster_whisper import WhisperModel
 
 from streaming import (
     BoundedAudioBuffer,
+    LocalAgreement,
+    SentenceAssembler,
     TranscriptSegment,
     TranscriptStabilizer,
+    Word,
     map_model_segments,
     normalize_text,
+    words_to_segment,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -251,6 +255,61 @@ def build_initial_prompt(client_prompt: str = "") -> str | None:
     return combined or None
 
 
+def resolve_streaming_mode() -> str:
+    """`sentence` re-transcribes whole sentences (LocalAgreement) on a GPU;
+    `rolling` uses fixed 4+2 s windows, which keeps a CPU real-time."""
+    requested = str(CONFIG.get("streaming_mode", "auto")).lower()
+    if requested in {"rolling", "sentence"}:
+        return requested
+    return "sentence" if DEVICE_RESOLVED == "cuda" else "rolling"
+
+
+def make_sentence_assembler(idle_flush_seconds: float) -> SentenceAssembler:
+    return SentenceAssembler(
+        pause_seconds=config_float("sentence_pause_seconds", 0.8, 0.2, 3.0),
+        max_chars=int(config_float("sentence_max_chars", 60, 20, 200)),
+        idle_flush_seconds=idle_flush_seconds,
+    )
+
+
+def provisional_payload(
+    assembler: SentenceAssembler, unstable: list[TranscriptSegment]
+) -> list[dict[str, Any]]:
+    """The unfinished sentence first (text that will not change), then the
+    still-changing tail."""
+    items: list[dict[str, Any]] = []
+    pending = assembler.pending()
+    if pending:
+        items.append({**pending.as_dict(), "stable": True})
+    items += [item.as_dict() for item in unstable]
+    return items
+
+
+def transcribe_words_sync(
+    model: WhisperModel,
+    audio: np.ndarray,
+    language: str,
+    initial_prompt: str | None,
+) -> list[Word]:
+    """Transcribe with word timestamps, relative to the start of `audio`."""
+    if audio.size == 0:
+        return []
+    segments = _run_model(model, audio, language, initial_prompt, word_timestamps=True)
+    words: list[Word] = []
+    for segment in segments:
+        segment_words = getattr(segment, "words", None)
+        if segment_words:
+            words += [
+                Word(float(word.start), float(word.end), str(word.word))
+                for word in segment_words
+            ]
+        elif normalize_text(getattr(segment, "text", "")):
+            words.append(
+                Word(float(segment.start), float(segment.end), " " + str(segment.text))
+            )
+    return words
+
+
 def transcribe_sync(
     model: WhisperModel,
     audio: np.ndarray,
@@ -259,7 +318,25 @@ def transcribe_sync(
 ) -> list[TranscriptSegment]:
     if audio.size == 0:
         return []
+    segments = _run_model(
+        model,
+        audio,
+        language,
+        initial_prompt,
+        word_timestamps=bool(CONFIG.get("word_timestamps", False)),
+    )
+    # Segment timestamps are relative to the supplied rolling audio window.
+    return map_model_segments(segments, 0.0)
 
+
+def _run_model(
+    model: WhisperModel,
+    audio: np.ndarray,
+    language: str,
+    initial_prompt: str | None,
+    *,
+    word_timestamps: bool,
+) -> list[Any]:
     vad_parameters = {
         "threshold": config_float("vad_threshold", 0.5, 0.0, 1.0),
         "min_speech_duration_ms": int(
@@ -279,7 +356,7 @@ def transcribe_sync(
         condition_on_previous_text=False,
         initial_prompt=initial_prompt,
         temperature=0.0,
-        word_timestamps=bool(CONFIG.get("word_timestamps", False)),
+        word_timestamps=word_timestamps,
         no_speech_threshold=config_float("no_speech_threshold", 0.6, 0.0, 1.0),
         log_prob_threshold=config_float("log_prob_threshold", -1.0, -5.0, 0.0),
         compression_ratio_threshold=config_float(
@@ -291,8 +368,7 @@ def transcribe_sync(
             else None
         ),
     )
-    # Segment timestamps are relative to the supplied rolling audio window.
-    return map_model_segments(list(segments), 0.0)
+    return list(segments)
 
 
 async def receive_audio(
@@ -353,6 +429,12 @@ async def process_audio(
 ) -> None:
     global LAST_METRICS
 
+    if resolve_streaming_mode() == "sentence":
+        await process_audio_sentence(
+            websocket, model, audio_buffer, client_config, graceful_stop
+        )
+        return
+
     chunk_seconds = config_float("chunk_seconds", 4.0, 2.0, 10.0)
     overlap_seconds = min(
         config_float("overlap_seconds", 2.0, 0.0, 5.0), chunk_seconds
@@ -369,6 +451,10 @@ async def process_audio(
     stabilizer = TranscriptStabilizer(
         horizon_seconds,
         config_float("reprediction_tolerance_seconds", 1.0, 0.25, 3.0),
+    )
+    # Committed text always lags the live audio by the commit horizon.
+    assembler = make_sentence_assembler(
+        horizon_seconds + config_float("sentence_pause_seconds", 0.8, 0.2, 3.0)
     )
     overlap_tail = b""
     previous_new_end_sample: int | None = None
@@ -413,10 +499,15 @@ async def process_audio(
             )
             for item in relative_segments
         ]
-        finalized, provisional = stabilizer.update(
+        committed, provisional = stabilizer.update(
             absolute_segments,
             window_start=window_start,
             audio_end=latest_audio_end,
+        )
+        finalized = assembler.add(
+            committed,
+            audio_end=latest_audio_end,
+            next_start=provisional[0].start if provisional else None,
         )
         sequence += 1
         LAST_METRICS = {
@@ -442,9 +533,10 @@ async def process_audio(
                 "type": "transcript_update",
                 "sequence": sequence,
                 "finalized": [item.as_dict() for item in finalized],
-                "provisional": [item.as_dict() for item in provisional],
+                "provisional": provisional_payload(assembler, provisional),
                 "new_seconds": round(sample_count / SAMPLE_RATE, 3),
                 "window_seconds": round(len(window) / BYTES_PER_SAMPLE / SAMPLE_RATE, 3),
+                "mode": "rolling",
                 **LAST_METRICS,
             },
         )
@@ -463,25 +555,176 @@ async def process_audio(
         if not await process_chunk(raw, start_sample):
             return
 
-    flushed = stabilizer.flush()
-    if flushed and graceful_stop.is_set():
-        sequence += 1
+    flushed = assembler.add(stabilizer.flush(), audio_end=latest_audio_end)
+    flushed += assembler.flush()
+    await send_final_flush(
+        websocket, flushed, sequence, latest_audio_end, audio_buffer, graceful_stop
+    )
+
+
+async def send_final_flush(
+    websocket: WebSocket,
+    flushed: list[TranscriptSegment],
+    sequence: int,
+    audio_end: float,
+    audio_buffer: BoundedAudioBuffer,
+    graceful_stop: asyncio.Event,
+) -> None:
+    if not graceful_stop.is_set():
+        return
+    if flushed:
         await websocket_send_json(
             websocket,
             {
                 "type": "transcript_update",
-                "sequence": sequence,
+                "sequence": sequence + 1,
                 "finalized": [item.as_dict() for item in flushed],
                 "provisional": [],
-                "audio_end": round(latest_audio_end, 3),
+                "audio_end": round(audio_end, 3),
                 "inference_ms": 0,
                 "queue_seconds": round(audio_buffer.seconds, 3),
                 "dropped_seconds": round(audio_buffer.dropped_seconds, 3),
             },
         )
+    await websocket_send_json(websocket, {"type": "stop_ack"})
 
-    if graceful_stop.is_set():
-        await websocket_send_json(websocket, {"type": "stop_ack"})
+
+async def process_audio_sentence(
+    websocket: WebSocket,
+    model: WhisperModel,
+    audio_buffer: BoundedAudioBuffer,
+    client_config: dict[str, str],
+    graceful_stop: asyncio.Event,
+) -> None:
+    """Sentence mode: re-transcribe everything since the last finished
+    sentence on every chunk and commit only words that two consecutive
+    hypotheses agree on (LocalAgreement-2). Needs a GPU to stay real-time."""
+    global LAST_METRICS
+
+    chunk_seconds = config_float("sentence_chunk_seconds", 2.0, 0.5, 6.0)
+    trim_seconds = config_float("sentence_trim_seconds", 10.0, 4.0, 25.0)
+    max_buffer_seconds = max(
+        trim_seconds, config_float("sentence_max_buffer_seconds", 20.0, 6.0, 30.0)
+    )
+    minimum_flush_seconds = config_float("minimum_flush_seconds", 1.0, 0.25, 3.0)
+    chunk_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * chunk_seconds)
+    minimum_flush_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * minimum_flush_seconds)
+
+    agreement = LocalAgreement()
+    # Agreement needs two hypotheses, so committed text lags by ~2 chunks.
+    assembler = make_sentence_assembler(
+        2 * chunk_seconds + config_float("sentence_pause_seconds", 0.8, 0.2, 3.0)
+    )
+    buffer = np.zeros((0,), dtype=np.float32)
+    buffer_start = 0.0
+    previous_end_sample: int | None = None
+    sequence = 0
+    latest_audio_end = 0.0
+
+    async def process_chunk(raw: bytes, start_sample: int) -> bool:
+        nonlocal buffer, buffer_start, previous_end_sample, sequence, latest_audio_end
+
+        sample_count = len(raw) // BYTES_PER_SAMPLE
+        if previous_end_sample is not None and start_sample != previous_end_sample:
+            log.warning(
+                "Audio backlog overflow: skipped %.2fs to preserve live position.",
+                max(0.0, (start_sample - previous_end_sample) / SAMPLE_RATE),
+            )
+            buffer = np.zeros((0,), dtype=np.float32)
+            agreement.reset_hypothesis()
+        if buffer.size == 0:
+            buffer_start = start_sample / SAMPLE_RATE
+        buffer = np.concatenate([buffer, pcm16_to_float32(raw)])
+        previous_end_sample = start_sample + sample_count
+        latest_audio_end = previous_end_sample / SAMPLE_RATE
+
+        started = time.perf_counter()
+        async with INFERENCE_LOCK:
+            relative_words = await asyncio.to_thread(
+                transcribe_words_sync,
+                model,
+                buffer,
+                client_config.get("language", str(CONFIG.get("language", "ko"))),
+                build_initial_prompt(client_config.get("initial_prompt", "")),
+            )
+        inference_ms = (time.perf_counter() - started) * 1000
+        words = [
+            Word(buffer_start + word.start, buffer_start + word.end, word.text)
+            for word in relative_words
+        ]
+        committed = words_to_segment(agreement.insert(words))
+        unstable = words_to_segment(agreement.provisional)
+        finalized = assembler.add(
+            [committed] if committed else [],
+            audio_end=latest_audio_end,
+            next_start=unstable.start if unstable else None,
+        )
+
+        # Drop audio that belongs to finished sentences so the next pass only
+        # re-reads the current sentence; cap the buffer if nothing agrees.
+        buffered = latest_audio_end - buffer_start
+        cut = None
+        if buffered > trim_seconds and assembler.last_sentence_end > buffer_start:
+            cut = assembler.last_sentence_end
+        elif buffered > max_buffer_seconds:
+            cut = max(agreement.committed_end, latest_audio_end - max_buffer_seconds / 2)
+            if agreement.committed_end <= buffer_start:
+                agreement.reset_hypothesis()
+        if cut is not None and cut > buffer_start:
+            drop = min(buffer.size, int((cut - buffer_start) * SAMPLE_RATE))
+            buffer = buffer[drop:]
+            buffer_start += drop / SAMPLE_RATE
+
+        sequence += 1
+        LAST_METRICS = {
+            "sequence": sequence,
+            "inference_ms": round(inference_ms, 1),
+            "queue_seconds": round(audio_buffer.seconds, 3),
+            "dropped_seconds": round(audio_buffer.dropped_seconds, 3),
+            "audio_end": round(latest_audio_end, 3),
+        }
+        if DEBUG_LOGGING:
+            log.debug(
+                "sentence buffer=%0.2fs inference=%0.0fms committed=%r unstable=%r",
+                buffered,
+                inference_ms,
+                committed.text if committed else "",
+                unstable.text if unstable else "",
+            )
+        return await websocket_send_json(
+            websocket,
+            {
+                "type": "transcript_update",
+                "sequence": sequence,
+                "finalized": [item.as_dict() for item in finalized],
+                "provisional": provisional_payload(
+                    assembler, [unstable] if unstable else []
+                ),
+                "new_seconds": round(sample_count / SAMPLE_RATE, 3),
+                "window_seconds": round(buffer.size / SAMPLE_RATE, 3),
+                "mode": "sentence",
+                **LAST_METRICS,
+            },
+        )
+
+    while True:
+        item = await audio_buffer.pop(chunk_bytes)
+        if item is None:
+            break
+        if not await process_chunk(*item):
+            return
+
+    remaining = audio_buffer.pop_remaining(minimum_flush_bytes)
+    if remaining and graceful_stop.is_set():
+        if not await process_chunk(*remaining):
+            return
+
+    last = words_to_segment(agreement.flush())
+    flushed = assembler.add([last] if last else [], audio_end=latest_audio_end)
+    flushed += assembler.flush()
+    await send_final_flush(
+        websocket, flushed, sequence, latest_audio_end, audio_buffer, graceful_stop
+    )
 
 
 app = FastAPI(title="YouTube Live Local STT", version="0.3.2")
@@ -502,6 +745,8 @@ async def health() -> dict[str, Any]:
         "gpu_runtime_status": GPU_RUNTIME_STATUS,
         "cuda_dll_directories": [str(path) for path in CUDA_DLL_DIRECTORIES],
         "automatic_cpu_fallback": True,
+        "streaming_mode": resolve_streaming_mode(),
+        "sentence_chunk_seconds": config_float("sentence_chunk_seconds", 2.0, 0.5, 6.0),
         "chunk_seconds": config_float("chunk_seconds", 4.0, 2.0, 10.0),
         "overlap_seconds": config_float("overlap_seconds", 2.0, 0.0, 5.0),
         "commit_horizon_seconds": config_float(
@@ -534,6 +779,7 @@ async def warmup() -> Any:
         "model_size": CONFIG.get("model_size", "small"),
         "device_resolved": DEVICE_RESOLVED,
         "compute_type": COMPUTE_RESOLVED,
+        "streaming_mode": resolve_streaming_mode(),
     }
 
 

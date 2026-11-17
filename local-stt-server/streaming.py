@@ -512,3 +512,211 @@ class BoundedAudioBuffer:
         del self._data[:byte_count]
         self._start_sample += byte_count // self.bytes_per_sample
         return raw, start_sample
+
+
+_SENTENCE_END = re.compile(r"[.?!。？！]+[\"'”’)\]]*(?=\s|$)")
+
+
+class SentenceAssembler:
+    """Group committed transcript fragments into whole sentences.
+
+    Fragments arrive in time order (from the rolling stabilizer or from
+    LocalAgreement). A sentence is emitted when it ends with sentence
+    punctuation, when the speaker pauses, or when it grows too long to read
+    as one subtitle line. The unfinished sentence is exposed as `pending`.
+    """
+
+    def __init__(
+        self,
+        pause_seconds: float = 0.8,
+        max_chars: int = 60,
+        idle_flush_seconds: float = 2.8,
+    ) -> None:
+        self.pause_seconds = max(0.1, float(pause_seconds))
+        self.max_chars = max(10, int(max_chars))
+        self.idle_flush_seconds = max(self.pause_seconds, float(idle_flush_seconds))
+        self._text = ""
+        # (character position in _text, timestamp) pairs for interpolation.
+        self._anchors: list[tuple[int, float]] = []
+        self.last_sentence_end = 0.0
+
+    @property
+    def pending_end(self) -> float | None:
+        return self._anchors[-1][1] if self._anchors else None
+
+    def _time_at(self, position: int) -> float:
+        anchors = self._anchors
+        if position <= anchors[0][0]:
+            return anchors[0][1]
+        for (left_pos, left_time), (right_pos, right_time) in zip(anchors, anchors[1:]):
+            if position <= right_pos:
+                if right_pos == left_pos:
+                    return right_time
+                ratio = (position - left_pos) / (right_pos - left_pos)
+                return left_time + (right_time - left_time) * ratio
+        return anchors[-1][1]
+
+    def _append(self, fragment: TranscriptSegment) -> None:
+        text = normalize_text(fragment.text)
+        if not text:
+            return
+        if self._text:
+            spacer = "" if re.match(r"^[,.!?;:)]", text) else " "
+            self._text += spacer
+        start_pos = len(self._text)
+        self._text += text
+        self._anchors.append((start_pos, float(fragment.start)))
+        self._anchors.append((len(self._text), float(fragment.end)))
+
+    def _emit(self, cut: int, output: list[TranscriptSegment]) -> None:
+        sentence = collapse_repetitions(self._text[:cut])
+        start = self._anchors[0][1]
+        end = max(start + 0.05, self._time_at(cut))
+        if sentence:
+            output.append(TranscriptSegment(start, end, sentence))
+            self.last_sentence_end = end
+        rest = self._text[cut:]
+        stripped = len(rest) - len(rest.lstrip())
+        new_start = cut + stripped
+        self._text = rest.lstrip()
+        if not self._text:
+            self._anchors = []
+            return
+        anchors = [(0, end)]
+        anchors += [
+            (position - new_start, timestamp)
+            for position, timestamp in self._anchors
+            if position > new_start
+        ]
+        self._anchors = anchors
+
+    def _split_ready(self, output: list[TranscriptSegment]) -> None:
+        while self._text:
+            match = _SENTENCE_END.search(self._text)
+            if match:
+                self._emit(match.end(), output)
+                continue
+            if len(self._text) > self.max_chars:
+                cut = self._text.rfind(" ", 0, self.max_chars + 1)
+                self._emit(cut if cut > self.max_chars // 2 else self.max_chars, output)
+                continue
+            break
+
+    def add(
+        self,
+        fragments: Iterable[TranscriptSegment],
+        *,
+        audio_end: float,
+        next_start: float | None = None,
+    ) -> list[TranscriptSegment]:
+        """Add committed fragments and return completed sentences.
+
+        `next_start` is the start of the earliest still-unstable speech, if
+        any; a gap before it counts as a pause.
+        """
+        output: list[TranscriptSegment] = []
+        for fragment in fragments:
+            end = self.pending_end
+            if end is not None and fragment.start - end >= self.pause_seconds:
+                self._emit(len(self._text), output)
+            self._append(fragment)
+            self._split_ready(output)
+
+        end = self.pending_end
+        if end is not None:
+            if next_start is not None:
+                if next_start - end >= self.pause_seconds:
+                    self._emit(len(self._text), output)
+            elif audio_end - end >= self.idle_flush_seconds:
+                self._emit(len(self._text), output)
+        return output
+
+    def pending(self) -> TranscriptSegment | None:
+        if not self._text:
+            return None
+        return TranscriptSegment(self._anchors[0][1], self._anchors[-1][1], self._text)
+
+    def flush(self) -> list[TranscriptSegment]:
+        output: list[TranscriptSegment] = []
+        if self._text:
+            self._emit(len(self._text), output)
+        return output
+
+
+@dataclass(frozen=True)
+class Word:
+    start: float
+    end: float
+    text: str
+
+
+def words_to_segment(words: list[Word]) -> TranscriptSegment | None:
+    """Join faster-whisper words (which carry their own leading spaces)."""
+    text = normalize_text("".join(word.text for word in words))
+    if not words or not text:
+        return None
+    return TranscriptSegment(words[0].start, max(words[0].start + 0.05, words[-1].end), text)
+
+
+class LocalAgreement:
+    """Commit only the words two consecutive hypotheses agree on.
+
+    The caller re-transcribes all audio since the last committed sentence on
+    every update. Words agreed by two hypotheses in a row are committed;
+    the rest stay provisional (LocalAgreement-2, as in whisper_streaming).
+    """
+
+    MAX_TAIL_NGRAM = 5
+
+    def __init__(self) -> None:
+        self.committed_end = 0.0
+        self._committed_tail: list[Word] = []
+        self._previous: list[Word] = []
+
+    @property
+    def provisional(self) -> list[Word]:
+        return list(self._previous)
+
+    def _fresh(self, words: Iterable[Word]) -> list[Word]:
+        fresh = [
+            word
+            for word in words
+            if comparison_text(word.text)
+            and (word.start + word.end) / 2 > self.committed_end
+        ]
+        # Drop a re-recognized copy of the committed tail at the start.
+        tail = self._committed_tail
+        for size in range(min(self.MAX_TAIL_NGRAM, len(tail), len(fresh)), 0, -1):
+            tail_text = comparison_text("".join(word.text for word in tail[-size:]))
+            head_text = comparison_text("".join(word.text for word in fresh[:size]))
+            if tail_text and tail_text == head_text:
+                fresh = fresh[size:]
+                break
+        return fresh
+
+    def _commit(self, words: list[Word]) -> None:
+        if not words:
+            return
+        self.committed_end = max(self.committed_end, words[-1].end)
+        self._committed_tail = (self._committed_tail + words)[-20:]
+
+    def insert(self, words: Iterable[Word]) -> list[Word]:
+        hypothesis = self._fresh(words)
+        agreed = 0
+        for new, old in zip(hypothesis, self._previous):
+            if comparison_text(new.text) != comparison_text(old.text):
+                break
+            agreed += 1
+        committed = hypothesis[:agreed]
+        self._commit(committed)
+        self._previous = hypothesis[agreed:]
+        return committed
+
+    def reset_hypothesis(self) -> None:
+        self._previous = []
+
+    def flush(self) -> list[Word]:
+        remaining = self._previous
+        self._commit(remaining)
+        self._previous = []
+        return remaining

@@ -318,5 +318,70 @@ class WebSocketLifecycleTests(unittest.TestCase):
         self.assertEqual(restarted[0]["sequence"], 1)
 
 
+@dataclass
+class FakeWord:
+    start: float
+    end: float
+    word: str
+
+
+@dataclass
+class FakeWordSegment:
+    start: float
+    end: float
+    text: str
+    words: list
+
+
+class SentenceModeWebSocketTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_model = server.MODEL
+        self.original_config = dict(server.CONFIG)
+        server.MODEL = FakeModel([
+            FakeWordSegment(0.1, 1.6, " 문장 모드 테스트입니다.", [
+                FakeWord(0.1, 0.5, " 문장"),
+                FakeWord(0.5, 0.9, " 모드"),
+                FakeWord(0.9, 1.6, " 테스트입니다."),
+            ])
+        ])
+        server.CONFIG.update({
+            "streaming_mode": "sentence",
+            "sentence_chunk_seconds": 1.0,
+            "queue_max_seconds": 8.0,
+            "minimum_flush_seconds": 0.25,
+        })
+
+    def tearDown(self) -> None:
+        server.MODEL = self.original_model
+        server.CONFIG.clear()
+        server.CONFIG.update(self.original_config)
+
+    def test_agreed_words_become_one_sentence(self) -> None:
+        pcm = np.zeros(server.SAMPLE_RATE, dtype="<i2").tobytes()
+        updates = []
+        with TestClient(server.app).websocket_connect("/ws/transcribe") as websocket:
+            websocket.receive_json()
+            websocket.receive_json()
+            websocket.send_bytes(pcm)
+            updates.append(websocket.receive_json())
+            websocket.send_bytes(pcm)
+            updates.append(websocket.receive_json())
+            websocket.send_json({"type": "stop"})
+            while True:
+                message = websocket.receive_json()
+                if message.get("type") == "stop_ack":
+                    break
+                updates.append(message)
+
+        self.assertEqual(updates[0]["mode"], "sentence")
+        # First pass: nothing agreed yet, the whole hypothesis is unstable.
+        self.assertEqual(updates[0]["finalized"], [])
+        self.assertEqual(updates[0]["provisional"][0]["text"], "문장 모드 테스트입니다.")
+        self.assertNotIn("stable", updates[0]["provisional"][0])
+        # Second pass agrees, and the sentence punctuation completes it.
+        finalized = [item["text"] for update in updates for item in update["finalized"]]
+        self.assertEqual(finalized, ["문장 모드 테스트입니다."])
+
+
 if __name__ == "__main__":
     unittest.main()
