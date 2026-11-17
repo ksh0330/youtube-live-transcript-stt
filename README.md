@@ -8,7 +8,9 @@
 ## 주요 기능
 
 - 탭 오디오를 캡처하면서 방송 소리는 그대로 재생
-- 약 4초마다 자막 갱신, 확정 자막과 수정될 수 있는 임시 자막을 구분
+- **문장 단위 자막:** 말하는 중인 문장은 한 줄로 이어지고(바뀔 수 있는 끝부분은 흐리게), 문장이 끝나면 확정
+- 영상 위 자막은 YouTube CC처럼 두 줄 (앞 문장 + 지금 문장)
+- NVIDIA GPU에서는 문장 전체를 다시 인식해 확정하는 **문장 모드**로 경계 오인식을 줄임
 - Side Panel·독립 창·영상 위 overlay에 같은 세션 표시
 - 자막 검색, TXT / SRT / VTT / JSON 저장
 - NVIDIA GPU가 있으면 CUDA, 없거나 실패하면 CPU로 자동 전환
@@ -30,11 +32,18 @@
 
 ```text
 YouTube 탭 오디오 ─ tabCapture ─▶ offscreen 문서 (16 kHz mono PCM16)
-   ─ WebSocket 127.0.0.1:8765 ─▶ faster-whisper ─▶ 안정화(확정/임시) ─▶ Side Panel · overlay
+   ─ WebSocket 127.0.0.1:8765 ─▶ faster-whisper ─▶ 확정 ─▶ 문장 조립 ─▶ Side Panel · overlay
 ```
 
-- **Rolling window:** 새 오디오 4초에 직전 2초를 붙여 6초 단위로 인식합니다.
-- **확정/임시:** 마지막 약 2초는 임시로 표시되고, 다음 window에서 고쳐진 뒤 확정됩니다.
+인식 방식은 장치에 따라 자동으로 고릅니다(`streaming_mode: auto`).
+
+| | 문장 모드 (GPU) | Rolling 모드 (CPU) |
+| --- | --- | --- |
+| 인식 단위 | 마지막으로 끝난 문장 이후의 오디오 전체를 2초마다 다시 인식 | 새 오디오 4초 + 직전 2초 |
+| 확정 기준 | 연속 두 번의 인식 결과가 일치한 단어만 확정 (LocalAgreement) | 끝에서 2초 이전 구간을 확정 |
+| 장점 | 문장 전체를 문맥으로 써서 경계에서 잘리거나 겹치는 일이 적음 | 연산량이 일정해서 CPU에서도 실시간 유지 |
+
+- **문장 조립:** 확정된 조각을 모아 마침표·물음표, 0.8초 이상 쉼, 60자 초과 중 하나가 오면 한 문장으로 확정합니다.
 - **중복 제거:** 겹치는 구간을 다시 인식한 결과는 시간(±1초)과 텍스트를 함께 비교해 한 번만 남깁니다. 시간이 떨어진 실제 반복 발화는 지우지 않습니다.
 - **반복 루프 제거:** 음악·무음에서 Whisper가 같은 문구를 3번 이상 반복하면 하나로 합칩니다.
 - **밀림 방지:** CPU가 실시간보다 느리면 처리 대기 오디오를 최대 16초로 제한하고 가장 오래된 부분부터 버립니다. 버린 시간은 UI에 표시됩니다.
@@ -47,6 +56,8 @@ YouTube 탭 오디오 ─ tabCapture ─▶ offscreen 문서 (16 kHz mono PCM16)
 | --- | --- | --- |
 | `model_size` | `small` | CPU에서 느리면 `base`, NVIDIA GPU가 있으면 `large-v3-turbo` |
 | `language` | `ko` | 인식 언어 |
+| `streaming_mode` | `auto` | `auto`는 GPU면 `sentence`, CPU면 `rolling` |
+| `sentence_pause_seconds` / `sentence_max_chars` | `0.8` / `60` | 문장을 끊는 쉼 길이 / 한 줄 최대 글자 수 |
 | `device` | `auto` | `auto`는 CUDA를 먼저 시도하고 실패하면 CPU `int8` |
 | `chunk_seconds` / `overlap_seconds` | `4.0` / `2.0` | 새 오디오 길이 / 앞 window와 겹치는 길이 |
 | `reprediction_tolerance_seconds` | `1.0` | 다시 인식된 같은 문장으로 볼 시간 허용 범위 |
@@ -58,7 +69,7 @@ YouTube 탭 오디오 ─ tabCapture ─▶ offscreen 문서 (16 kHz mono PCM16)
 ### NVIDIA GPU로 더 빠르고 정확하게
 
 1. `start_server.bat`을 한 번 실행한 뒤 `setup_gpu.bat` 실행 (CUDA 런타임을 `.venv`에만 설치하고 실제 추론으로 확인)
-2. `server_config.local.json`에 더 큰 모델을 지정하고 서버 재시작
+2. `server_config.local.json`에 더 큰 모델을 지정하고 서버 재시작 (GPU에서는 문장 모드가 자동으로 켜지고, Side Panel 서버 상태에 `문장 모드`가 보입니다)
 
 ```json
 { "model_size": "large-v3-turbo" }
@@ -86,7 +97,23 @@ large-v3-turbo는 "C 언어의 int와 long 자료형, C89와 C99"처럼 영어·
 
 ## 측정 결과
 
-48초 한국어 TTS 강의 클립, `small / cpu / int8` 기준입니다. 자세한 조건은 [AUDIT_REPORT.md](docs/AUDIT_REPORT.md)에 있습니다.
+### 문장 모드 비교 (v0.4.0)
+
+48초 한국어 TTS 강의 클립(원문 8문장)을 실제 서버 코드에 실시간 순서로 흘려보낸 결과입니다. RTX 5060 Ti, i7-11700 기준입니다.
+
+| 설정 | 확정 문장 수 | 평균 추론 | 확정까지 걸린 시간 (평균 / 최대) |
+| --- | ---: | ---: | ---: |
+| small · CPU · rolling | 10 | 2,044ms | 3.2초 / 4.8초 |
+| large-v3-turbo · GPU · rolling | 10 | 278ms | 4.0초 / 5.9초 |
+| **large-v3-turbo · GPU · 문장 모드** | **8** | 293ms | **3.0초** / 6.1초 |
+
+- Rolling 모드는 window 경계에서 "3.", "할 수 있습니다.", "으로 다시 설명하겠습니다."처럼 문장이 잘린 조각이 남았습니다.
+- 문장 모드는 원문과 같은 8문장으로 나뉘었고, "C 언어의 인트와 롱 자료형, C89와 C99 표준도 비교하겠습니다."처럼 문장 단위로 정확하게 확정했습니다.
+- "확정까지 걸린 시간"은 문장이 끝난 시점부터 확정 자막이 나올 때까지입니다. 말하는 중에는 그 사이에도 임시 자막이 계속 보입니다.
+
+### 이전 측정 (v0.3.x, small / CPU)
+
+자세한 조건은 [AUDIT_REPORT.md](docs/AUDIT_REPORT.md)에 있습니다.
 
 - window 비교에서 4+2초가 평균 추론 1.98초(p95 2.19초), 중복 초과율 0%로 기본값으로 선택됨
 - 30분·1시간·3시간 과부하 시뮬레이션에서 대기 오디오 16초, 화면 줄 수 500개로 제한
@@ -95,7 +122,8 @@ large-v3-turbo는 "C 언어의 int와 long 자료형, C89와 C99"처럼 영어·
 
 ## 한계
 
-- 빠른 화자 전환, 큰 배경음, 숫자·영어 혼합에서는 window 경계 인식이 흔들릴 수 있습니다.
+- 빠른 화자 전환, 큰 배경음, 숫자·영어 혼합에서는 인식이 흔들릴 수 있습니다. CPU의 rolling 모드에서는 window 경계에서 문장이 잘린 조각이 남을 수 있습니다.
+- 문장 모드는 말이 쉬지 않고 이어지면 20초마다 강제로 끊어 다시 인식합니다.
 - 정밀한 자막 편집보다 라이브 기록·검색·요약 용도에 맞습니다.
 - 재생 중 seek나 일시정지를 반복하면 타임코드가 영상과 어긋날 수 있습니다.
 - Chrome의 탭 캡처 정책이나 YouTube 페이지 구조가 바뀌면 영향을 받을 수 있습니다.
@@ -105,10 +133,10 @@ large-v3-turbo는 "C 언어의 int와 long 자료형, C89와 C99"처럼 영어·
 ```bash
 cd local-stt-server
 python -m pip install -r requirements-dev.txt
-python -m unittest discover -s tests -v          # Python 37개
+python -m unittest discover -s tests -v          # Python 48개
 
 cd ..
-node --test extension/tests/transcript-utils.test.js   # Node 5개
+node --test extension/tests/transcript-utils.test.js   # Node 8개
 ```
 
 실제 모델로 확인하려면 서버를 켠 뒤 다음을 실행합니다.
