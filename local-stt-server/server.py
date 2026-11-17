@@ -353,7 +353,10 @@ async def process_audio(
     overlap_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * overlap_seconds)
     minimum_flush_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * minimum_flush_seconds)
 
-    stabilizer = TranscriptStabilizer(horizon_seconds)
+    stabilizer = TranscriptStabilizer(
+        horizon_seconds,
+        config_float("reprediction_tolerance_seconds", 1.0, 0.25, 3.0),
+    )
     overlap_tail = b""
     previous_new_end_sample: int | None = None
     sequence = 0

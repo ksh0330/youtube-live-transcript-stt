@@ -6,6 +6,7 @@
   "chunk_seconds": 4.0,
   "overlap_seconds": 2.0,
   "commit_horizon_seconds": 2.0,
+  "reprediction_tolerance_seconds": 1.0,
   "queue_max_seconds": 16.0,
   "minimum_flush_seconds": 1.0,
   "beam_size": 1,

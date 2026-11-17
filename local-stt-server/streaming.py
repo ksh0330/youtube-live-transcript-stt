@@ -95,6 +95,87 @@ def merge_overlapping_text(history: str, incoming: str) -> str:
     return normalize_text(f"{history}{spacer}{unique}")
 
 
+MIN_CONTAINED_CHARS = 4
+
+
+def is_contained(inner: str, outer: str) -> bool:
+    """True when `inner` appears inside `outer`, ignoring spacing/punctuation."""
+    inner_comp = comparison_text(inner)
+    return len(inner_comp) >= MIN_CONTAINED_CHARS and inner_comp in comparison_text(outer)
+
+
+def texts_overlap(first: str, second: str) -> bool:
+    """True when two recognitions of nearby audio share text in any direction."""
+    return bool(
+        overlap_cut(first, second)
+        or overlap_cut(second, first)
+        or is_contained(first, second)
+        or is_contained(second, first)
+    )
+
+
+def merge_reprediction(previous: str, incoming: str) -> str:
+    """Combine two recognitions of the same audio without repeating text."""
+    if is_contained(incoming, previous):
+        return normalize_text(previous)
+    if is_contained(previous, incoming):
+        return normalize_text(incoming)
+    return merge_overlapping_text(previous, incoming)
+
+
+MAX_REPEATED_TOKENS = 8
+MIN_REPEAT_COUNT = 3
+
+
+def _collapse_token_repeats(text: str) -> str:
+    tokens = text.split()
+    changed = True
+    while changed:
+        changed = False
+        for size in range(1, min(MAX_REPEATED_TOKENS, len(tokens) // MIN_REPEAT_COUNT) + 1):
+            index = 0
+            while index + size * MIN_REPEAT_COUNT <= len(tokens):
+                unit = comparison_text(" ".join(tokens[index:index + size]))
+                if not unit:
+                    index += 1
+                    continue
+                repeats = 1
+                while (
+                    index + size * (repeats + 1) <= len(tokens)
+                    and comparison_text(
+                        " ".join(tokens[index + size * repeats:index + size * (repeats + 1)])
+                    ) == unit
+                ):
+                    repeats += 1
+                if repeats >= MIN_REPEAT_COUNT:
+                    del tokens[index + size:index + size * repeats]
+                    changed = True
+                index += 1
+    return " ".join(tokens)
+
+
+_CHAR_REPEAT = re.compile(r"(\S.{3,40}?)\1{2,}")
+
+
+def _collapse_char_repeat(match: re.Match[str]) -> str:
+    unit = match.group(1)
+    # Keep numbers such as 1000000 intact; only collapse repeated words.
+    return unit if any(char.isalpha() for char in unit) else match.group(0)
+
+
+def collapse_repetitions(text: str) -> str:
+    """Remove Whisper repetition loops (the same phrase 3+ times in a row).
+
+    A phrase spoken twice is kept; three or more consecutive copies inside a
+    single segment are almost always a decoding loop on music or silence.
+    """
+    text = normalize_text(text)
+    if not text:
+        return ""
+    text = _collapse_token_repeats(text)
+    return normalize_text(_CHAR_REPEAT.sub(_collapse_char_repeat, text))
+
+
 @dataclass(frozen=True)
 class TranscriptSegment:
     start: float
@@ -120,7 +201,7 @@ def map_model_segments(
 ) -> list[TranscriptSegment]:
     mapped: list[TranscriptSegment] = []
     for segment in segments:
-        text = normalize_text(getattr(segment, "text", ""))
+        text = collapse_repetitions(getattr(segment, "text", ""))
         if not text:
             continue
         start = window_start + max(0.0, float(getattr(segment, "start", 0.0)))
@@ -128,14 +209,52 @@ def map_model_segments(
         cleaned = TranscriptSegment(start, end, text).cleaned()
         if cleaned:
             mapped.append(cleaned)
-    return sorted(mapped, key=lambda item: (item.start, item.end))
+    return collapse_repeated_segments(
+        sorted(mapped, key=lambda item: (item.start, item.end))
+    )
+
+
+def collapse_repeated_segments(
+    segments: list[TranscriptSegment],
+) -> list[TranscriptSegment]:
+    """Merge 3+ consecutive segments with identical text from one window."""
+    result: list[TranscriptSegment] = []
+    index = 0
+    while index < len(segments):
+        run_end = index + 1
+        key = comparison_text(segments[index].text)
+        while (
+            key
+            and run_end < len(segments)
+            and comparison_text(segments[run_end].text) == key
+        ):
+            run_end += 1
+        if run_end - index >= MIN_REPEAT_COUNT:
+            first = segments[index]
+            result.append(
+                TranscriptSegment(first.start, segments[run_end - 1].end, first.text)
+            )
+        else:
+            result.extend(segments[index:run_end])
+        index = run_end
+    return result
 
 
 class TranscriptStabilizer:
     """Keep a short revisable tail and emit only segments behind a time horizon."""
 
-    def __init__(self, commit_horizon_seconds: float = 2.0) -> None:
+    def __init__(
+        self,
+        commit_horizon_seconds: float = 2.0,
+        reprediction_tolerance_seconds: float = 1.0,
+    ) -> None:
         self.commit_horizon_seconds = max(0.5, float(commit_horizon_seconds))
+        # Whisper timestamps for the same words can move by up to about a
+        # second between overlapping windows, so a re-recognition of the
+        # previous provisional tail is matched with this time tolerance.
+        self.reprediction_tolerance_seconds = max(
+            0.25, float(reprediction_tolerance_seconds)
+        )
         self.final_end = 0.0
         self._final_context = ""
         self._previous_provisional: list[TranscriptSegment] = []
@@ -179,15 +298,23 @@ class TranscriptStabilizer:
         )
         horizon = max(0.0, float(audio_end) - self.commit_horizon_seconds)
 
+        tolerance = self.reprediction_tolerance_seconds
+
+        def near(first: TranscriptSegment, second: TranscriptSegment) -> bool:
+            return (
+                first.start <= second.end + tolerance
+                and first.end >= second.start - tolerance
+            )
+
         raw_final_candidates = [item for item in current_segments if item.end <= horizon]
         final_candidates: list[TranscriptSegment] = []
         for candidate in raw_final_candidates:
             overlapping_previous = [
                 item
                 for item in self._previous_provisional
-                if item.start <= candidate.end + 0.25
-                and item.end >= candidate.start - 0.25
+                if near(item, candidate)
                 and item.end > self.final_end + 0.05
+                and texts_overlap(item.text, candidate.text)
             ]
             if overlapping_previous:
                 previous = max(
@@ -195,12 +322,11 @@ class TranscriptStabilizer:
                     key=lambda item: min(item.end, candidate.end)
                     - max(item.start, candidate.start),
                 )
-                if overlap_cut(previous.text, candidate.text):
-                    candidate = TranscriptSegment(
-                        min(previous.start, candidate.start),
-                        max(previous.end, candidate.end),
-                        merge_overlapping_text(previous.text, candidate.text),
-                    )
+                candidate = TranscriptSegment(
+                    min(previous.start, candidate.start),
+                    max(previous.end, candidate.end),
+                    merge_reprediction(previous.text, candidate.text),
+                )
             final_candidates.append(candidate)
 
         # A long Whisper segment can begin before the next rolling window. Keep
@@ -216,12 +342,7 @@ class TranscriptStabilizer:
             and item.start < covered_start
             and item.start <= window_start + 0.25
             and not any(
-                candidate.start <= item.end + 0.25
-                and candidate.end >= item.start - 0.25
-                and (
-                    overlap_cut(item.text, candidate.text)
-                    or overlap_cut(candidate.text, item.text)
-                )
+                near(candidate, item) and texts_overlap(item.text, candidate.text)
                 for candidate in final_candidates
             )
         ]

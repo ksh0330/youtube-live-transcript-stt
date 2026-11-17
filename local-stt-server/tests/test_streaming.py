@@ -13,6 +13,7 @@ from streaming import (  # noqa: E402
     BoundedAudioBuffer,
     TranscriptSegment,
     TranscriptStabilizer,
+    collapse_repetitions,
     map_model_segments,
     merge_overlapping_text,
     remove_overlap,
@@ -144,6 +145,70 @@ class StabilizerTests(unittest.TestCase):
             "다시 설명하겠습니다",
         ])
 
+    def test_shifted_reprediction_of_provisional_is_not_duplicated(self) -> None:
+        # The next window re-recognizes the provisional sentence, but Whisper
+        # moves its timestamps by 0.4 s. It must be emitted once.
+        stabilizer = TranscriptStabilizer(commit_horizon_seconds=2.0)
+        first, _ = stabilizer.update(
+            [
+                TranscriptSegment(0.0, 1.8, "오늘은 자료형을 봅니다"),
+                TranscriptSegment(2.0, 3.9, "다음 문장을 설명합니다"),
+            ],
+            window_start=0.0,
+            audio_end=4.0,
+        )
+        second, _ = stabilizer.update(
+            [TranscriptSegment(4.3, 5.8, "다음 문장을 설명합니다")],
+            window_start=2.0,
+            audio_end=8.0,
+        )
+        texts = [item.text for item in first + second + stabilizer.flush()]
+        self.assertEqual(texts, ["오늘은 자료형을 봅니다", "다음 문장을 설명합니다"])
+
+    def test_partial_reprediction_inside_provisional_is_not_duplicated(self) -> None:
+        stabilizer = TranscriptStabilizer(commit_horizon_seconds=2.0)
+        first, _ = stabilizer.update(
+            [
+                TranscriptSegment(0.0, 1.8, "오늘은 자료형을 봅니다"),
+                TranscriptSegment(2.0, 3.9, "int와 long 자료형을 비교합니다"),
+            ],
+            window_start=0.0,
+            audio_end=4.0,
+        )
+        second, _ = stabilizer.update(
+            [
+                TranscriptSegment(4.4, 5.6, "long 자료형을"),
+                TranscriptSegment(6.5, 7.0, "다음으로"),
+            ],
+            window_start=2.0,
+            audio_end=8.0,
+        )
+        texts = [item.text for item in first + second + stabilizer.flush()]
+        self.assertEqual(
+            texts,
+            ["오늘은 자료형을 봅니다", "int와 long 자료형을 비교합니다", "다음으로"],
+        )
+
+    def test_new_sentence_near_provisional_is_kept(self) -> None:
+        stabilizer = TranscriptStabilizer(commit_horizon_seconds=2.0)
+        stabilizer.update(
+            [TranscriptSegment(2.0, 3.9, "자료형을 비교합니다")],
+            window_start=0.0,
+            audio_end=4.0,
+        )
+        final, _ = stabilizer.update(
+            [
+                TranscriptSegment(2.1, 3.9, "자료형을 비교합니다"),
+                TranscriptSegment(4.2, 5.5, "포인터는 주소를 저장합니다"),
+            ],
+            window_start=2.0,
+            audio_end=8.0,
+        )
+        self.assertEqual(
+            [item.text for item in final],
+            ["자료형을 비교합니다", "포인터는 주소를 저장합니다"],
+        )
+
     def test_back_to_back_real_repeat_is_preserved(self) -> None:
         stabilizer = TranscriptStabilizer(commit_horizon_seconds=0.5)
         first, _ = stabilizer.update(
@@ -172,6 +237,41 @@ class TimestampTests(unittest.TestCase):
             [FakeModelSegment(1.2, 4.1, "테스트")], window_start=120.0
         )
         self.assertEqual(mapped[0], TranscriptSegment(121.2, 124.1, "테스트"))
+
+    def test_identical_segments_from_one_window_are_collapsed(self) -> None:
+        mapped = map_model_segments(
+            [
+                FakeModelSegment(0.0, 1.0, "감사합니다."),
+                FakeModelSegment(1.0, 2.0, "감사합니다."),
+                FakeModelSegment(2.0, 3.0, "감사합니다."),
+                FakeModelSegment(3.0, 4.0, "다음 강의입니다"),
+            ],
+            window_start=0.0,
+        )
+        self.assertEqual(
+            mapped,
+            [
+                TranscriptSegment(0.0, 3.0, "감사합니다."),
+                TranscriptSegment(3.0, 4.0, "다음 강의입니다"),
+            ],
+        )
+
+
+class RepetitionTests(unittest.TestCase):
+    def test_repetition_loop_inside_segment_is_collapsed(self) -> None:
+        self.assertEqual(
+            collapse_repetitions("감사합니다. 감사합니다. 감사합니다. 감사합니다."),
+            "감사합니다.",
+        )
+        self.assertEqual(
+            collapse_repetitions("구독 좋아요 구독 좋아요 구독 좋아요 알림 설정"),
+            "구독 좋아요 알림 설정",
+        )
+        self.assertEqual(collapse_repetitions("감사합니다감사합니다감사합니다"), "감사합니다")
+
+    def test_short_real_repeats_and_numbers_are_kept(self) -> None:
+        self.assertEqual(collapse_repetitions("네 네 오늘은"), "네 네 오늘은")
+        self.assertEqual(collapse_repetitions("1000000원입니다"), "1000000원입니다")
 
 
 class AudioBufferTests(unittest.IsolatedAsyncioTestCase):
