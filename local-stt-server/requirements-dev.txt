@@ -1,2 +1,4 @@
 -r requirements.txt
 httpx>=0.28,<1
+# faster-whisper 1.2 decode_audio() breaks on PyAV 19; only scripts/ read audio files
+av>=11,<18

@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$OutputPath = "benchmark-results/lecture-fixture.wav"
 )
 
