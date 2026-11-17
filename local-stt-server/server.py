@@ -471,7 +471,7 @@ async def process_audio(
         await websocket_send_json(websocket, {"type": "stop_ack"})
 
 
-app = FastAPI(title="YouTube Live Local STT", version="0.3.0")
+app = FastAPI(title="YouTube Live Local STT", version="0.3.1")
 
 
 @app.get("/health")

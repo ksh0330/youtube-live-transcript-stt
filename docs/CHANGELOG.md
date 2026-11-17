@@ -1,5 +1,15 @@
 # 변경 이력
 
+## v0.3.1 — 경계 중복 출력 수정
+
+- 다음 window가 임시 자막을 다시 인식할 때 Whisper 타임스탬프가 0.25초 이상 밀리면 같은 문장이 두 번 확정되던 문제 수정 (시간 허용 범위 1초, `reprediction_tolerance_seconds`)
+- 다시 인식된 문장이 이전 임시 자막 안에 포함되거나 그 반대인 경우도 같은 발화로 처리
+- 다음 window가 끝 단어를 빼고 다시 인식해 "자료형 크기를 반드시 자료형 크기를"처럼 반복되던 문제 수정
+- Whisper 반복 루프(같은 문구 3번 이상 연속)와 한 window 안의 같은 segment 3개 이상을 하나로 합침
+- `generate_fixture.ps1`이 Windows PowerShell 5.1에서 한글이 깨진 음성을 만들던 문제 수정 (UTF-8 BOM)
+- 개발 의존성에 `av<18` 고정 (PyAV 19에서 `decode_audio()` 실패)
+- README를 빠른 시작·설정·문제 해결 중심으로 정리
+
 ## v0.3.0 변경점 — rolling stabilizer + bounded queue
 
 - `4초 새 오디오 + 2초 overlap + 2초 commit horizon`
