@@ -87,6 +87,33 @@ class LocalizeUpdateTests(unittest.TestCase):
         # One batched call per update.
         self.assertEqual(len(self.fake.calls), 1)
 
+    def test_cpu_translates_only_finished_sentences(self) -> None:
+        original_device, original_config = server.DEVICE_RESOLVED, dict(server.CONFIG)
+        provisional = [{"start": 1.0, "end": 2.0, "text": "still speaking", "stable": True}]
+        try:
+            server.DEVICE_RESOLVED = "cpu"
+            finals, current = self.run_localize(
+                [TranscriptSegment(0.0, 1.0, "Hello.")], provisional, {"language": "en", "translate_to": "ko"}
+            )
+            self.assertEqual(finals[0]["text"], "[en->ko] Hello.")
+            # The sentence being spoken stays as recognized until it is finished.
+            self.assertEqual(current, provisional)
+            self.assertEqual(self.fake.calls[-1][0], ["Hello."])
+
+            # Nothing finished yet: no translation call at all.
+            self.fake.calls.clear()
+            self.run_localize([], provisional, {"language": "en", "translate_to": "ko"})
+            self.assertEqual(self.fake.calls, [])
+
+            # The setting can turn it back on.
+            server.CONFIG["translate_current_sentence"] = True
+            _, current = self.run_localize([], provisional, {"language": "en", "translate_to": "ko"})
+            self.assertEqual(current[0]["text"], "[en->ko] still speaking")
+        finally:
+            server.DEVICE_RESOLVED = original_device
+            server.CONFIG.clear()
+            server.CONFIG.update(original_config)
+
     def test_auto_language_uses_detected_source(self) -> None:
         finals, _ = self.run_localize(
             [TranscriptSegment(0.0, 1.0, "Thank you.")],

@@ -2,6 +2,7 @@
   "model_size": "small",
   "language": "ko",
   "translation_model": "OpenNMT/nllb-200-distilled-1.3B-ct2-int8",
+  "translate_current_sentence": "auto",
   "device": "auto",
   "compute_type": "auto",
   "streaming_mode": "auto",

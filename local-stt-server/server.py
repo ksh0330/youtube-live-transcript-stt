@@ -265,6 +265,14 @@ def resolve_streaming_mode() -> str:
     return "sentence" if DEVICE_RESOLVED == "cuda" else "rolling"
 
 
+def reported_streaming_mode() -> str:
+    """Mode for /health. Before the model loads the device is not known yet,
+    so `auto` is reported as is instead of guessing `rolling`."""
+    if MODEL is None and str(CONFIG.get("streaming_mode", "auto")).lower() not in {"rolling", "sentence"}:
+        return "auto"
+    return resolve_streaming_mode()
+
+
 def make_sentence_assembler(idle_flush_seconds: float) -> SentenceAssembler:
     return SentenceAssembler(
         pause_seconds=config_float("sentence_pause_seconds", 0.8, 0.2, 3.0),
@@ -358,6 +366,21 @@ async def translate_texts(texts: list[str], source: str | None, target: str) -> 
         return None
 
 
+def translate_current_sentence() -> bool:
+    """Whether the sentence still being spoken is translated on every update.
+    `auto` skips it on a CPU, where translating it each time takes about 1 s
+    per 4 s of audio; finished sentences are always translated."""
+    value = CONFIG.get("translate_current_sentence", "auto")
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off"}:
+        return False
+    return DEVICE_RESOLVED != "cpu"
+
+
 async def localize_update(
     finalized: list[TranscriptSegment],
     provisional: list[dict[str, Any]],
@@ -372,7 +395,9 @@ async def localize_update(
     if not target or not needs_translation(source, target):
         return final_items, provisional
 
-    current_text = " ".join(str(item["text"]) for item in provisional if item.get("text"))
+    current_text = ""
+    if translate_current_sentence():
+        current_text = " ".join(str(item["text"]) for item in provisional if item.get("text"))
     texts = [item["text"] for item in final_items] + ([current_text] if current_text else [])
     translated = await translate_texts(texts, source, target)
     if translated is None:
@@ -702,7 +727,8 @@ async def process_audio(
     else:
         flushed_items = []
     await send_final_flush(
-        websocket, flushed_items, sequence, latest_audio_end, audio_buffer, graceful_stop
+        websocket, flushed_items, sequence, latest_audio_end, audio_buffer, graceful_stop,
+        mode="rolling", language=source_language(client_config, last_detected),
     )
 
 
@@ -713,6 +739,9 @@ async def send_final_flush(
     audio_end: float,
     audio_buffer: BoundedAudioBuffer,
     graceful_stop: asyncio.Event,
+    *,
+    mode: str,
+    language: str | None,
 ) -> None:
     if not graceful_stop.is_set():
         return
@@ -728,6 +757,8 @@ async def send_final_flush(
                 "inference_ms": 0,
                 "queue_seconds": round(audio_buffer.seconds, 3),
                 "dropped_seconds": round(audio_buffer.dropped_seconds, 3),
+                "mode": mode,
+                "language": language,
             },
         )
     await websocket_send_json(websocket, {"type": "stop_ack"})
@@ -884,11 +915,12 @@ async def process_audio_sentence(
     else:
         flushed_items = []
     await send_final_flush(
-        websocket, flushed_items, sequence, latest_audio_end, audio_buffer, graceful_stop
+        websocket, flushed_items, sequence, latest_audio_end, audio_buffer, graceful_stop,
+        mode="sentence", language=source_language(client_config, last_detected),
     )
 
 
-app = FastAPI(title="YouTube Live Local STT", version="0.4.2")
+app = FastAPI(title="YouTube Live Local STT", version="0.4.3")
 
 
 @app.get("/health")
@@ -906,7 +938,7 @@ async def health() -> dict[str, Any]:
         "gpu_runtime_status": GPU_RUNTIME_STATUS,
         "cuda_dll_directories": [str(path) for path in CUDA_DLL_DIRECTORIES],
         "automatic_cpu_fallback": True,
-        "streaming_mode": resolve_streaming_mode(),
+        "streaming_mode": reported_streaming_mode(),
         "sentence_chunk_seconds": config_float("sentence_chunk_seconds", 2.0, 0.5, 6.0),
         "translation_model": str(CONFIG.get("translation_model") or DEFAULT_TRANSLATION_MODEL),
         "translation_error": TRANSLATION_ERROR,

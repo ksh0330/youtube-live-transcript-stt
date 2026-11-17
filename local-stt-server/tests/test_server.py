@@ -86,6 +86,28 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config["language"], "ko")
 
 
+class StreamingModeReportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.saved = (server.MODEL, server.DEVICE_RESOLVED, dict(server.CONFIG))
+
+    def tearDown(self) -> None:
+        server.MODEL, server.DEVICE_RESOLVED, config = self.saved
+        server.CONFIG.clear()
+        server.CONFIG.update(config)
+
+    def test_health_reports_auto_until_the_model_decides_the_device(self) -> None:
+        server.CONFIG["streaming_mode"] = "auto"
+        server.MODEL, server.DEVICE_RESOLVED = None, "unloaded"
+        self.assertEqual(asyncio.run(server.health())["streaming_mode"], "auto")
+
+        server.MODEL, server.DEVICE_RESOLVED = FakeModel([]), "cuda"
+        self.assertEqual(asyncio.run(server.health())["streaming_mode"], "sentence")
+
+        server.CONFIG["streaming_mode"] = "rolling"
+        server.MODEL = None
+        self.assertEqual(asyncio.run(server.health())["streaming_mode"], "rolling")
+
+
 class FakeBackend:
     def __init__(self, events: list[str] | None = None, name: str = "model") -> None:
         self.events = events
@@ -313,6 +335,9 @@ class WebSocketLifecycleTests(unittest.TestCase):
         self.assertEqual(first[0]["provisional"][0]["text"], "WebSocket 테스트")
         flushed = [item for item in first if item.get("finalized")]
         self.assertEqual(flushed[-1]["finalized"][0]["text"], "WebSocket 테스트")
+        # The flush sent on stop carries the same mode and language as other updates.
+        self.assertEqual(flushed[-1]["mode"], first[0]["mode"])
+        self.assertEqual(flushed[-1]["language"], "ko")
 
         restarted = self._run_session()
         self.assertEqual(restarted[0]["sequence"], 1)
