@@ -22,10 +22,17 @@
     },
     segments,
     provisional: [{
-      id: "mock-provisional",
+      id: "mock-provisional-stable",
       start: 2205,
+      end: 2207,
+      text: "다음 구간에서는 scaling factor와",
+      provisional: true,
+      stable: true
+    }, {
+      id: "mock-provisional",
+      start: 2207,
       end: 2209,
-      text: "다음 구간에서는 scaling factor와 Floating Point의 차이를 설명하겠습니다.",
+      text: "Floating Point의 차이를 설명하겠습니다",
       provisional: true
     }],
     lastSequence: 521,
