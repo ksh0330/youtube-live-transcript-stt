@@ -1,7 +1,17 @@
 (() => {
   "use strict";
-  if (globalThis.__YTLT_STT_CONTENT__) return;
-  globalThis.__YTLT_STT_CONTENT__ = true;
+  // Skip only if a live copy is already running. A copy left over from before
+  // an extension reload is orphaned (its chrome.runtime.id is gone), so a
+  // freshly injected copy takes over.
+  const existing = globalThis.__YTLT_STT_CONTENT__;
+  if (typeof existing === "function" && existing()) return;
+  globalThis.__YTLT_STT_CONTENT__ = () => {
+    try {
+      return Boolean(chrome.runtime?.id);
+    } catch (_) {
+      return false;
+    }
+  };
 
   const OVERLAY_ID = "ytlt-stt-overlay";
   const DEFAULT_SETTINGS = {

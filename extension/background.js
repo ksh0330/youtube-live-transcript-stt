@@ -156,11 +156,39 @@ async function ensureOffscreen() {
   }
 }
 
-async function getPageInfo(tabId) {
+// After the extension is reloaded or updated, YouTube tabs that were already
+// open keep an orphaned content script that no longer receives messages, so
+// the overlay silently stops. Inject the current content script again.
+async function injectContentScript(tabId) {
   try {
-    const response = await chrome.tabs.sendMessage(tabId, { type: "YTLT_GET_PAGE_INFO" });
-    if (response?.ok) return response.info;
-  } catch (_) {}
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function sendToContent(tabId, message) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch (_) {
+    if (!(await injectContentScript(tabId))) return null;
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
+  const tabs = await chrome.tabs.query({ url: ["https://www.youtube.com/*", "https://youtube.com/*"] });
+  await Promise.all(tabs.map(tab => injectContentScript(tab.id)));
+});
+
+async function getPageInfo(tabId) {
+  const response = await sendToContent(tabId, { type: "YTLT_GET_PAGE_INFO" });
+  if (response?.ok) return response.info;
 
   const tab = await chrome.tabs.get(tabId);
   return {
@@ -200,14 +228,12 @@ function latestOverlayText() {
 async function syncOverlay(tabId = session?.tabId) {
   if (!Number.isInteger(tabId)) return;
   const enabled = Boolean(session.overlayEnabled && session.tabId === tabId);
-  try {
-    await chrome.tabs.sendMessage(tabId, {
-      type: "YTLT_OVERLAY_TEXT",
-      enabled,
-      text: enabled ? latestOverlayText() : "",
-      settings: session.settings
-    });
-  } catch (_) {}
+  await sendToContent(tabId, {
+    type: "YTLT_OVERLAY_TEXT",
+    enabled,
+    text: enabled ? latestOverlayText() : "",
+    settings: session.settings
+  });
 }
 
 async function startCaptureWithStream(streamId, tabId) {
