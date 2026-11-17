@@ -104,6 +104,9 @@ button.danger-ghost { color:var(--danger); }
 .transcript-item.provisional .transcript-time { color:var(--yellow); }
 .provisional-label { display:block; margin-bottom:2px; color:var(--yellow); font-size:9px; font-weight:800; }
 .transcript-text .unstable { opacity:.55; }
+.transcript-original { display:block; margin-top:2px; color:var(--muted); font-size:10px; }
+.settings-grid .check-label { display:flex; align-items:center; gap:6px; grid-column:span 2; }
+.settings-grid .check-label input { accent-color:var(--accent); }
 .render-limit { margin:8px; color:var(--muted); font-size:9px; text-align:center; }
 mark { padding:0 2px; border-radius:2px; background:#6d4f00; color:#fff1b8; }
 .empty { margin:16px 8px; color:var(--muted); font-size:11px; line-height:1.5; }

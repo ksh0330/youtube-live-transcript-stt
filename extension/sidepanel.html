@@ -55,8 +55,21 @@
     </label>
 
     <details class="settings-card">
-      <summary>오버레이·인식 문맥 설정</summary>
+      <summary>언어·오버레이·인식 문맥 설정</summary>
       <div class="settings-grid">
+        <label>인식 언어
+          <select id="language">
+            <option value="auto">자동 감지</option>
+            <option value="ko">한국어</option>
+            <option value="en">영어</option>
+            <option value="ja">일본어</option>
+            <option value="zh">중국어</option>
+          </select>
+        </label>
+        <label class="check-label">
+          <input id="translateToKorean" type="checkbox">
+          한국어로 번역해서 보기
+        </label>
         <label>위치
           <select id="overlayPosition">
             <option value="top">상단</option>
@@ -83,7 +96,7 @@
       <label class="prompt-label" for="contextPrompt">선택 문맥 프롬프트</label>
       <textarea id="contextPrompt" rows="3" maxlength="1000" placeholder="예: 반도체 설계 강의이며 Verilog, FPGA 용어가 포함됩니다."></textarea>
       <div class="settings-actions">
-        <small id="settingsStatus">다음 STT 시작부터 문맥 프롬프트가 적용됩니다.</small>
+        <small id="settingsStatus">언어·번역·문맥 프롬프트는 다음 STT 시작부터 적용됩니다.</small>
         <button id="saveSettingsBtn" type="button">설정 저장</button>
       </div>
     </details>

@@ -121,7 +121,10 @@
       return {
         ext: "txt",
         mime: "text/plain;charset=utf-8",
-        content: header + items.map(item => `[${formatClock(item.start)}] ${item.text}`).join("\n")
+        content: header + items.map(item => {
+          const line = `[${formatClock(item.start)}] ${item.text}`;
+          return item.original ? `${line}\n           (원문) ${item.original}` : line;
+        }).join("\n")
       };
     }
     if (format === "srt") {
@@ -181,7 +184,8 @@
       end: Math.max(...items.map(item => Number(item.end) || 0)),
       text: [stableText, unstableText].filter(Boolean).join(" "),
       stableText,
-      unstableText
+      unstableText,
+      original: items.map(item => String(item.original || "").trim()).filter(Boolean).join(" ")
     };
   }
 
@@ -216,6 +220,7 @@
       start: last && sentence.start < Number(last.end) ? Number(last.end) : sentence.start,
       end: sentence.end,
       text: sentence.text,
+      ...(sentence.original ? { original: sentence.original } : {}),
       observedAt: new Date().toISOString()
     };
     segment.end = Math.max(segment.start + 0.05, segment.end);

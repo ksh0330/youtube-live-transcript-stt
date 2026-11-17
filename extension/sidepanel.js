@@ -24,6 +24,8 @@
     overlaySize: document.getElementById("overlaySize"),
     overlayOpacity: document.getElementById("overlayOpacity"),
     contextPrompt: document.getElementById("contextPrompt"),
+    language: document.getElementById("language"),
+    translateToKorean: document.getElementById("translateToKorean"),
     saveSettingsBtn: document.getElementById("saveSettingsBtn"),
     settingsStatus: document.getElementById("settingsStatus"),
     searchInput: document.getElementById("searchInput"),
@@ -78,6 +80,15 @@
     const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return safe.replace(new RegExp(`(${escaped})`, "gi"), "<mark>$1</mark>");
   }
+
+  // Translated lines show the spoken text underneath.
+  function originalHtml(item) {
+    return item?.original
+      ? `<span class="transcript-original">${highlight(item.original, els.searchInput.value)}</span>`
+      : "";
+  }
+
+  const LANGUAGE_NAMES = { ko: "한국어", en: "영어", ja: "일본어", zh: "중국어" };
 
   async function checkServer() {
     els.serverState.textContent = "확인 중…";
@@ -160,7 +171,7 @@
     const finalHtml = visibleFinal.map(item => `
       <article class="transcript-item">
         <time class="transcript-time">${utils.formatClock(item.start)}</time>
-        <div class="transcript-text">${highlight(item.text, els.searchInput.value)}</div>
+        <div class="transcript-text">${highlight(item.text, els.searchInput.value)}${originalHtml(item)}</div>
       </article>
     `).join("");
     const provisionalHtml = matchingProvisional.map(item => {
@@ -171,7 +182,7 @@
       return `
       <article class="transcript-item provisional">
         <time class="transcript-time">${utils.formatClock(item.start)}</time>
-        <div class="transcript-text"><span class="provisional-label">말하는 중 · 흐린 부분은 바뀔 수 있음</span>${[stable, unstable].filter(Boolean).join(" ")}</div>
+        <div class="transcript-text"><span class="provisional-label">말하는 중 · 흐린 부분은 바뀔 수 있음</span>${[stable, unstable].filter(Boolean).join(" ")}${originalHtml(item)}</div>
       </article>
     `;
     }).join("");
@@ -190,6 +201,8 @@
     els.overlaySize.value = settings.overlaySize || "medium";
     els.overlayOpacity.value = String(settings.overlayOpacity ?? 0.8);
     els.contextPrompt.value = settings.contextPrompt || "";
+    els.language.value = settings.language || "auto";
+    els.translateToKorean.checked = settings.translateToKorean !== false;
   }
 
   function render() {
@@ -211,7 +224,11 @@
 
     els.videoTitle.textContent = state?.metadata?.title || "YouTube 라이브를 열어주세요.";
     const channel = state?.metadata?.channel ? ` · ${state.metadata.channel}` : "";
-    els.videoMeta.textContent = state?.metadata ? `${state.metadata.videoId || "YouTube"}${channel}` : "CC가 없어도 탭 오디오로 인식합니다.";
+    const spoken = state?.metrics?.language;
+    const languageLabel = spoken ? ` · ${LANGUAGE_NAMES[spoken] || spoken}` : "";
+    els.videoMeta.textContent = state?.metadata
+      ? `${state.metadata.videoId || "YouTube"}${channel}${languageLabel}`
+      : "CC가 없어도 탭 오디오로 인식합니다.";
     const allText = [...items, ...provisional].map(item => item.text).join(" ").trim();
     els.segmentCount.textContent = String(items.length);
     els.wordCount.textContent = allText ? String(allText.split(/\s+/).filter(Boolean).length) : "0";
@@ -295,11 +312,20 @@
     render();
   });
 
-  [els.overlayPosition, els.overlaySize, els.overlayOpacity, els.contextPrompt].forEach(input => {
-    input.addEventListener("input", () => {
+  [
+    els.overlayPosition,
+    els.overlaySize,
+    els.overlayOpacity,
+    els.contextPrompt,
+    els.language,
+    els.translateToKorean
+  ].forEach(input => {
+    const markDirty = () => {
       settingsDirty = true;
       els.settingsStatus.textContent = "저장되지 않은 변경 사항이 있습니다.";
-    });
+    };
+    input.addEventListener("input", markDirty);
+    input.addEventListener("change", markDirty);
   });
   els.saveSettingsBtn.addEventListener("click", async () => {
     els.saveSettingsBtn.disabled = true;
@@ -311,13 +337,15 @@
           overlayPosition: els.overlayPosition.value,
           overlaySize: els.overlaySize.value,
           overlayOpacity: Number(els.overlayOpacity.value),
-          contextPrompt: els.contextPrompt.value
+          contextPrompt: els.contextPrompt.value,
+          language: els.language.value,
+          translateToKorean: els.translateToKorean.checked
         }
       });
       if (!response?.ok) throw new Error(response?.error || "설정을 저장하지 못했습니다.");
       state = response.state;
       settingsDirty = false;
-      els.settingsStatus.textContent = "저장됨 · 문맥 프롬프트는 다음 STT 시작부터 적용됩니다.";
+      els.settingsStatus.textContent = "저장됨 · 언어·번역·문맥 프롬프트는 다음 STT 시작부터 적용됩니다.";
       render();
     } catch (error) {
       showNotice(String(error?.message || error));

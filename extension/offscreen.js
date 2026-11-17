@@ -131,7 +131,7 @@
     if (activeSessionId === stoppedSessionId) activeSessionId = null;
   }
 
-  function connectWebSocket(wsUrl, language, initialPrompt, sessionId) {
+  function connectWebSocket(wsUrl, language, initialPrompt, sessionId, translateTo = "") {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(wsUrl);
       ws.binaryType = "arraybuffer";
@@ -147,7 +147,8 @@
         ws.send(JSON.stringify({
           type: "config",
           language: language || "ko",
-          initial_prompt: String(initialPrompt || "").slice(0, 1000)
+          initial_prompt: String(initialPrompt || "").slice(0, 1000),
+          translate_to: String(translateTo || "")
         }));
         reportStatus("connected", null, sessionId);
         resolve(ws);
@@ -186,7 +187,8 @@
               dropped_seconds: data.dropped_seconds,
               new_seconds: data.new_seconds,
               window_seconds: data.window_seconds,
-              mode: data.mode
+              mode: data.mode,
+              language: data.language
             });
           } else if (data.type === "transcript" && data.text) {
             await chrome.runtime.sendMessage({
@@ -218,13 +220,13 @@
     });
   }
 
-  async function startCapture({ streamId, wsUrl, language, initialPrompt, sessionId }) {
+  async function startCapture({ streamId, wsUrl, language, initialPrompt, sessionId, translateTo }) {
     await stopCapture({ flush: false });
     activeSessionId = sessionId || `${Date.now()}`;
     const currentSessionId = activeSessionId;
     await reportStatus("connecting", null, currentSessionId);
 
-    const ws = await connectWebSocket(wsUrl, language, initialPrompt, currentSessionId);
+    const ws = await connectWebSocket(wsUrl, language, initialPrompt, currentSessionId, translateTo);
 
     try {
       stream = await navigator.mediaDevices.getUserMedia({

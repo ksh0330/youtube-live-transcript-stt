@@ -145,6 +145,20 @@ test("stop promotes stable and changing parts as one sentence", () => {
   assert.equal(state.segments.at(-1).end, 10.5);
 });
 
+test("translated lines keep the spoken text in TXT export and on stop", () => {
+  const state = fixtureState();
+  state.segments = [{ start: 0, end: 2, text: "시청해 주셔서 감사합니다.", original: "ご視聴ありがとうございました。" }];
+  const txt = buildExport(state, "txt").content;
+  assert.match(txt, /\[00:00:00\] 시청해 주셔서 감사합니다\./);
+  assert.match(txt, /\(원문\) ご視聴ありがとうございました。/);
+  // SRT shows only the translated text.
+  assert.doesNotMatch(buildExport(state, "srt").content, /ご視聴/);
+
+  state.provisional = [{ start: 3, end: 4, text: "오늘 날씨가 좋네요", original: "今日はいい天気ですね" }];
+  const [promoted] = promoteProvisional(state);
+  assert.equal(promoted.original, "今日はいい天気ですね");
+});
+
 test("stop promotes the last provisional segment without timestamp reversal", () => {
   const state = fixtureState();
   state.provisional = [{ start: 7.5, end: 10, text: "마지막 문장", provisional: true }];

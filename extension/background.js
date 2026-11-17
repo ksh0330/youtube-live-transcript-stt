@@ -8,8 +8,12 @@ const DEFAULT_SETTINGS = Object.freeze({
   overlayPosition: "bottom",
   overlaySize: "medium",
   overlayOpacity: 0.8,
-  contextPrompt: ""
+  contextPrompt: "",
+  // Whisper language (`auto` detects once and locks) and Korean translation.
+  language: "auto",
+  translateToKorean: true
 });
+const LANGUAGES = new Set(["auto", "ko", "en", "ja", "zh"]);
 
 let creatingOffscreen = null;
 let session = null;
@@ -26,7 +30,9 @@ function normalizedSettings(value = {}) {
     overlayPosition: positions.has(value.overlayPosition) ? value.overlayPosition : DEFAULT_SETTINGS.overlayPosition,
     overlaySize: sizes.has(value.overlaySize) ? value.overlaySize : DEFAULT_SETTINGS.overlaySize,
     overlayOpacity: [0.5, 0.7, 0.8, 0.9].includes(opacity) ? opacity : DEFAULT_SETTINGS.overlayOpacity,
-    contextPrompt: String(value.contextPrompt || "").replace(/\s+/g, " ").trim().slice(0, 1000)
+    contextPrompt: String(value.contextPrompt || "").replace(/\s+/g, " ").trim().slice(0, 1000),
+    language: LANGUAGES.has(value.language) ? value.language : DEFAULT_SETTINGS.language,
+    translateToKorean: value.translateToKorean !== false
   };
 }
 
@@ -275,7 +281,8 @@ async function startCaptureWithStream(streamId, tabId) {
     sessionId: session.sessionId,
     streamId,
     wsUrl: "ws://127.0.0.1:8765/ws/transcribe",
-    language: "ko",
+    language: session.settings.language,
+    translateTo: session.settings.translateToKorean ? "ko" : "",
     initialPrompt: session.settings.contextPrompt
   });
 
@@ -304,7 +311,10 @@ function normalizedIncomingSegment(item, sequence, index) {
     raw: item?.raw || text,
     observedAt: new Date().toISOString(),
     sequence,
-    ...(item?.stable ? { stable: true } : {})
+    ...(item?.stable ? { stable: true } : {}),
+    // Set when the text was translated; `original` keeps the spoken text.
+    ...(item?.original ? { original: String(item.original).trim() } : {}),
+    ...(item?.language ? { language: String(item.language) } : {})
   };
 }
 
@@ -372,7 +382,8 @@ async function appendTranscriptUpdate(message) {
     inferenceSeconds,
     queueSeconds,
     droppedSeconds,
-    audioEnd
+    audioEnd,
+    language: message.language || session.metrics?.language || null
   };
   await syncOverlay();
   await broadcastDelta({
