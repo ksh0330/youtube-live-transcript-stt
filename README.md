@@ -57,7 +57,7 @@ Side Panel의 **언어·오버레이·인식 문맥 설정**에서 고르고 **�
 - **인식 언어:** 기본은 `자동 감지`입니다. 처음에 확신도 0.8 이상으로 감지된 언어를 그 세션 동안 고정해서, 음악이나 고유명사 때문에 언어가 왔다 갔다 하지 않습니다.
 - **한국어로 번역해서 보기 (기본 켜짐):** 한국어가 아닌 말은 문장 단위로 한국어로 번역해서 보여 줍니다. Whisper의 자체 번역은 영어로만 되기 때문에, 번역에는 로컬 [NLLB-200](https://huggingface.co/OpenNMT/nllb-200-distilled-1.3B-ct2-int8) 1.3B 모델(CTranslate2 int8)을 따로 씁니다.
   - 처음 쓸 때 번역 모델(약 1.4GB)을 내려받고, 준비되는 동안에는 원문이 그대로 보입니다.
-  - 문장 하나 번역에 RTX 5060 Ti에서 약 0.2초, CPU(i7-11700)에서 약 0.4초가 걸렸습니다.
+  - 번역을 켜면 업데이트 한 번이 GPU(RTX 5060 Ti)에서 약 0.4초, CPU(i7-11700)에서 약 1초 늘어납니다. CPU에서는 4초 분량 오디오를 처리하는 데 평균 3.6초(최대 4.8초)가 걸려 실시간 한계에 가깝습니다. `STT 지연`이 계속 커지면 `model_size`를 `base`로 낮추거나 번역을 끄세요.
   - 영어는 번역 품질이 좋은 편입니다. 일본어는 일상 문장은 자연스럽지만, 기술 용어는 틀리게 번역할 수 있습니다.
 - 번역된 자막 아래에는 원문이 작게 표시되고, TXT 저장에는 `(원문)` 줄이 함께 들어갑니다. SRT/VTT에는 번역문만 들어갑니다.
 
@@ -106,25 +106,46 @@ large-v3-turbo는 "C 언어의 int와 long 자료형, C89와 C99"처럼 영어·
 | 인식이 부정확하거나 `STT 지연`이 계속 큼 | NVIDIA GPU가 있으면 위 GPU 설정. 없으면 `model_size`를 `base`로 낮추거나, 오버레이·인식 문맥 설정에 주제와 고유명사를 적기 |
 | `GPU runtime unavailable` / `cublas64_12.dll` 오류 | 자동으로 CPU로 전환된 상태입니다. GPU를 쓰려면 `setup_gpu.bat` 실행 |
 | 영상 위 자막만 안 보이고 Side Panel에는 나옴 | YouTube 탭을 새로고침 (v0.4.1부터는 확장 프로그램 업데이트 때 자동으로 다시 연결) |
+| 번역이 안 되고 원문만 나옴 | 처음에는 번역 모델(약 1.4GB)을 내려받는 중입니다. 계속 원문만 나오면 `http://127.0.0.1:8765/health`의 `translation_error` 확인 |
+| 언어가 잘못 감지됨 | 방송 시작 부분의 음악이나 다른 언어 때문일 수 있습니다. 설정에서 인식 언어를 직접 고르기 |
 | `Cannot capture a tab with an active stream` | 팝업의 **남아 있는 캡처 강제 해제** → 다시 시도 |
 | 시작 버튼이 Side Panel에 없음 | Chrome은 Side Panel 클릭으로 탭 캡처 권한을 주지 않아서, 시작은 툴바 팝업에서만 합니다 |
 | 영상을 바꾸면 기록이 멈춤 | 다른 영상의 자막이 섞이지 않도록 의도한 동작입니다 |
 
 ## 측정 결과
 
-### 문장 모드 비교 (v0.4.0)
+v0.4.2 코드로 다시 측정했습니다. TTS로 만든 클립을 실제 서버 코드에 실시간 순서로 흘려보냈고, RTX 5060 Ti와 i7-11700 기준입니다. `scripts/compare_modes.py`로 같은 측정을 다시 할 수 있습니다([개발](#개발) 참고).
 
-48초 한국어 TTS 강의 클립(원문 8문장)을 실제 서버 코드에 실시간 순서로 흘려보낸 결과입니다. RTX 5060 Ti, i7-11700 기준입니다.
+### 한국어: 인식 방식 비교
 
-| 설정 | 확정 문장 수 | 평균 추론 | 확정까지 걸린 시간 (평균 / 최대) |
+48초 한국어 강의 클립(원문 8문장)입니다.
+
+| 설정 | 확정 문장 수 | 업데이트 한 번 처리 시간 | 확정까지 걸린 시간 (평균 / 최대) |
 | --- | ---: | ---: | ---: |
-| small · CPU · rolling | 10 | 2,044ms | 3.2초 / 4.8초 |
-| large-v3-turbo · GPU · rolling | 10 | 278ms | 4.0초 / 5.9초 |
-| **large-v3-turbo · GPU · 문장 모드** | **8** | 293ms | **3.0초** / 6.1초 |
+| small · CPU · rolling | 10 | 2.33초 / 오디오 4초 | 3.2초 / 4.8초 |
+| large-v3-turbo · GPU · rolling | 10 | 0.33초 / 오디오 4초 | 4.0초 / 5.9초 |
+| **large-v3-turbo · GPU · 문장 모드** | **8** | 0.31초 / 오디오 2초 | **3.3초** / 6.1초 |
 
 - Rolling 모드는 window 경계에서 "3.", "할 수 있습니다.", "으로 다시 설명하겠습니다."처럼 문장이 잘린 조각이 남았습니다.
-- 문장 모드는 원문과 같은 8문장으로 나뉘었고, "C 언어의 인트와 롱 자료형, C89와 C99 표준도 비교하겠습니다."처럼 문장 단위로 정확하게 확정했습니다.
+- 문장 모드는 원문과 같은 8문장으로 나뉘었고, "C 언어의 인트와 롱 자료형, C89와 C99 표준도 비교하겠습니다."처럼 문장 단위로 정확하게 확정했습니다. 인식 언어를 `자동 감지`로 두어도 한국어로 감지되어 결과가 같았습니다.
 - "확정까지 걸린 시간"은 문장이 끝난 시점부터 확정 자막이 나올 때까지입니다. 말하는 중에는 그 사이에도 임시 자막이 계속 보입니다.
+
+### 영어 → 한국어 번역
+
+18초 영어 클립(원문 4문장)을 인식 언어 `자동 감지`, 한국어 번역 켜짐으로 흘려보냈습니다.
+
+| 설정 | 감지 언어 | 확정 문장 수 | 업데이트 한 번 처리 시간 (평균 / 최대) | 확정까지 걸린 시간 (평균 / 최대) |
+| --- | --- | ---: | ---: | ---: |
+| small · CPU · rolling | 영어 | 4 | 3.64초 / 4.84초 (오디오 4초) | 3.8초 / 4.8초 |
+| large-v3-turbo · GPU · 문장 모드 | 영어 | 4 | 0.75초 / 1.30초 (오디오 2초) | 3.0초 / 3.3초 |
+
+두 설정 모두 4문장을 빠짐없이 인식했고, 번역 결과도 같았습니다.
+
+| 원문 | 번역 |
+| --- | --- |
+| A 32-bit value can hold both an integer part and a fraction part. | 32비트 값은 정수 부분과 분수 부분을 모두 포함할 수 있습니다. |
+| The court ruled that he was not criminally liable because he acted in self-defense. | 법원은 그가 자기 방어로 행동했기 때문에 형사적으로 책임을 지지 않는다고 판결했습니다. |
+| Thanks for watching, and do not forget to subscribe. | 시청해주셔서 감사합니다. 구독을 잊지 마세요. |
 
 ### 이전 측정 (v0.3.x, small / CPU)
 
@@ -155,11 +176,25 @@ cd ..
 node --test extension/tests/transcript-utils.test.js   # Node 11개
 ```
 
-실제 모델로 확인하려면 서버를 켠 뒤 다음을 실행합니다.
+실제 모델로 확인할 때는 먼저 TTS 클립을 만듭니다. WAV와 원문 TXT가 `benchmark-results/`에 생깁니다.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/generate_fixture.ps1
+powershell -ExecutionPolicy Bypass -File scripts/generate_fixture.ps1               # 한국어
+powershell -ExecutionPolicy Bypass -File scripts/generate_fixture.ps1 -Language en  # 영어
+```
+
+켜 둔 서버에 실시간 속도로 보내 보려면:
+
+```powershell
 python scripts/smoke_websocket.py benchmark-results/lecture-fixture.wav --duration 50
+python scripts/smoke_websocket.py benchmark-results/english-fixture.wav --duration 20 --language auto --translate-to ko
+```
+
+설정별로 비교하려면(측정 결과 표를 만든 스크립트):
+
+```powershell
+python scripts/compare_modes.py benchmark-results/lecture-fixture.wav small:cpu:int8:rolling large-v3-turbo:cuda:float16:sentence
+python scripts/compare_modes.py benchmark-results/english-fixture.wav large-v3-turbo:cuda:float16:sentence --language auto --translate-to ko
 ```
 
 `scripts/benchmark_whisper.py`(window 비교), `scripts/simulate_long_run.py`(장시간 부하), `scripts/*-harness.html`(화면 점검)도 있습니다.

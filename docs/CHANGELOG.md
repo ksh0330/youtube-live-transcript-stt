@@ -1,5 +1,10 @@
 # 변경 이력
 
+## 릴리스 이후 (main)
+
+- 측정 정리: `scripts/compare_modes.py`(설정별 비교, 번역 포함)를 추가하고, `generate_fixture.ps1 -Language en`으로 영어 클립을 만들 수 있게 했습니다. `smoke_websocket.py`는 `--language`·`--translate-to`를 받고 WAV를 PyAV 없이 읽습니다.
+- README와 [감사·성능 보고서](AUDIT_REPORT.md)를 v0.4.2 코드로 다시 잰 값으로 바꿨습니다. 서버와 확장 프로그램 코드는 v0.4.2와 같습니다.
+
 ## v0.4.2 — 언어 선택과 한국어 번역
 
 - **인식 언어 선택:** 자동 감지(기본), 한국어, 영어, 일본어, 중국어. 자동 감지는 처음 확신도 0.8 이상으로 감지된 언어를 그 세션 동안 고정합니다.
