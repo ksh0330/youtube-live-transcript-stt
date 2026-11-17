@@ -1,9 +1,13 @@
 # 변경 이력
 
-## 릴리스 이후 (main)
+## v0.4.3 — CPU 번역 가볍게, 테스트 자동화
 
+- **CPU 번역 부담 줄이기:** CPU에서는 말하는 중인 문장은 원문으로 보여 주고, 문장이 끝나면 번역합니다. 영어 클립에서 4초 분량 오디오 처리가 평균 3.64초(최대 4.84초)에서 2.92초(최대 3.90초)로 줄어 실시간 안에 들어옵니다. GPU는 지금처럼 말하는 중인 문장도 번역합니다. `translate_current_sentence`(`auto` / `true` / `false`)로 바꿀 수 있습니다.
+- 중지할 때 보내는 마지막 업데이트에도 `mode`와 `language`를 넣었습니다.
+- `/health`가 모델을 불러오기 전에는 GPU PC에서도 `rolling`으로 표시하던 것을 `auto`로 표시합니다. 장치는 모델을 불러올 때 정해집니다.
+- **GitHub Actions:** `main`에 push할 때와 PR마다 Python 테스트(Windows)와 확장 프로그램 문법 검사·테스트(Ubuntu)를 돌립니다. README에 결과 배지를 달았습니다.
 - 측정 정리: `scripts/compare_modes.py`(설정별 비교, 번역 포함)를 추가하고, `generate_fixture.ps1 -Language en`으로 영어 클립을 만들 수 있게 했습니다. `smoke_websocket.py`는 `--language`·`--translate-to`를 받고 WAV를 PyAV 없이 읽습니다.
-- README와 [감사·성능 보고서](AUDIT_REPORT.md)를 v0.4.2 코드로 다시 잰 값으로 바꿨습니다. 서버와 확장 프로그램 코드는 v0.4.2와 같습니다.
+- README와 [감사·성능 보고서](AUDIT_REPORT.md)를 다시 잰 값으로 바꿨습니다. 확장 프로그램 코드는 v0.4.2와 같아서, 업데이트할 때는 서버만 다시 켜면 됩니다.
 
 ## v0.4.2 — 언어 선택과 한국어 번역
 

@@ -1,5 +1,8 @@
 # YouTube Live Transcript STT
 
+[![tests](https://github.com/ksh0330/youtube-live-transcript-stt/actions/workflows/tests.yml/badge.svg)](https://github.com/ksh0330/youtube-live-transcript-stt/actions/workflows/tests.yml)
+[![release](https://img.shields.io/github/v/release/ksh0330/youtube-live-transcript-stt)](https://github.com/ksh0330/youtube-live-transcript-stt/releases/latest)
+
 자막(CC)이 없는 YouTube 라이브도 **내 PC에서 실시간으로 받아쓰는** Chrome 확장 프로그램입니다.
 탭 오디오를 로컬 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 서버로 보내 전사하며, 오디오는 외부로 전송되지 않습니다.
 
@@ -57,7 +60,7 @@ Side Panel의 **언어·오버레이·인식 문맥 설정**에서 고르고 **�
 - **인식 언어:** 기본은 `자동 감지`입니다. 처음에 확신도 0.8 이상으로 감지된 언어를 그 세션 동안 고정해서, 음악이나 고유명사 때문에 언어가 왔다 갔다 하지 않습니다.
 - **한국어로 번역해서 보기 (기본 켜짐):** 한국어가 아닌 말은 문장 단위로 한국어로 번역해서 보여 줍니다. Whisper의 자체 번역은 영어로만 되기 때문에, 번역에는 로컬 [NLLB-200](https://huggingface.co/OpenNMT/nllb-200-distilled-1.3B-ct2-int8) 1.3B 모델(CTranslate2 int8)을 따로 씁니다.
   - 처음 쓸 때 번역 모델(약 1.4GB)을 내려받고, 준비되는 동안에는 원문이 그대로 보입니다.
-  - 번역을 켜면 업데이트 한 번이 GPU(RTX 5060 Ti)에서 약 0.4초, CPU(i7-11700)에서 약 1초 늘어납니다. CPU에서는 4초 분량 오디오를 처리하는 데 평균 3.6초(최대 4.8초)가 걸려 실시간 한계에 가깝습니다. `STT 지연`이 계속 커지면 `model_size`를 `base`로 낮추거나 번역을 끄세요.
+  - 번역을 켜면 업데이트 한 번이 GPU(RTX 5060 Ti)에서 약 0.4초 늘어납니다. CPU에서는 부담을 줄이려고 말하는 중인 문장은 원문으로 보여 주고, 문장이 끝나면 번역합니다. 이렇게 해서 CPU(i7-11700)에서 4초 분량 오디오 처리가 평균 3.6초(최대 4.8초)에서 2.9초(최대 3.9초)로 줄었습니다. CPU에서도 말하는 중인 문장까지 번역하려면 `translate_current_sentence`를 `true`로 바꾸세요.
   - 영어는 번역 품질이 좋은 편입니다. 일본어는 일상 문장은 자연스럽지만, 기술 용어는 틀리게 번역할 수 있습니다.
 - 번역된 자막 아래에는 원문이 작게 표시되고, TXT 저장에는 `(원문)` 줄이 함께 들어갑니다. SRT/VTT에는 번역문만 들어갑니다.
 
@@ -70,6 +73,7 @@ Side Panel의 **언어·오버레이·인식 문맥 설정**에서 고르고 **�
 | `model_size` | `small` | CPU에서 느리면 `base`, NVIDIA GPU가 있으면 `large-v3-turbo` |
 | `language` | `ko` | 확장 프로그램이 언어를 보내지 않을 때 쓰는 기본 인식 언어 |
 | `translation_model` | `OpenNMT/nllb-200-distilled-1.3B-ct2-int8` | 번역 모델 (Hugging Face 저장소 이름 또는 로컬 경로) |
+| `translate_current_sentence` | `auto` | 말하는 중인 문장도 번역할지. `auto`는 GPU에서만 번역하고 CPU에서는 끝난 문장만 번역 |
 | `streaming_mode` | `auto` | `auto`는 GPU면 `sentence`, CPU면 `rolling` |
 | `sentence_pause_seconds` / `sentence_max_chars` | `0.8` / `60` | 문장을 끊는 쉼 길이 / 문장 최대 길이 (한글 기준, 영어는 약 2배) |
 | `device` | `auto` | `auto`는 CUDA를 먼저 시도하고 실패하면 CPU `int8` |
@@ -136,10 +140,10 @@ v0.4.2 코드로 다시 측정했습니다. TTS로 만든 클립을 실제 서�
 
 | 설정 | 감지 언어 | 확정 문장 수 | 업데이트 한 번 처리 시간 (평균 / 최대) | 확정까지 걸린 시간 (평균 / 최대) |
 | --- | --- | ---: | ---: | ---: |
-| small · CPU · rolling | 영어 | 4 | 3.64초 / 4.84초 (오디오 4초) | 3.8초 / 4.8초 |
+| small · CPU · rolling | 영어 | 4 | 2.92초 / 3.90초 (오디오 4초) | 3.8초 / 4.8초 |
 | large-v3-turbo · GPU · 문장 모드 | 영어 | 4 | 0.75초 / 1.30초 (오디오 2초) | 3.0초 / 3.3초 |
 
-두 설정 모두 4문장을 빠짐없이 인식했고, 번역 결과도 같았습니다.
+두 설정 모두 4문장을 빠짐없이 인식했고, 번역 결과도 같았습니다. CPU에서는 말하는 중인 문장을 번역하지 않습니다(위 [다른 언어와 한국어 번역](#다른-언어와-한국어-번역) 참고).
 
 | 원문 | 번역 |
 | --- | --- |
@@ -170,7 +174,7 @@ v0.4.2 코드로 다시 측정했습니다. TTS로 만든 클립을 실제 서�
 ```bash
 cd local-stt-server
 python -m pip install -r requirements-dev.txt
-python -m unittest discover -s tests -v          # Python 58개
+python -m unittest discover -s tests -v          # Python 60개
 
 cd ..
 node --test extension/tests/transcript-utils.test.js   # Node 11개
