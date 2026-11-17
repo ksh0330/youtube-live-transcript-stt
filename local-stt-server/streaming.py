@@ -517,6 +517,22 @@ class BoundedAudioBuffer:
 _SENTENCE_END = re.compile(r"[.?!。？！]+[\"'”’)\]]*(?=\s|$)")
 
 
+def display_width(text: str) -> int:
+    """Hangul, kana and CJK characters count as 2, everything else as 1, so a
+    length limit means about the same amount of speech in every language."""
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def _width_cut(text: str, max_width: int) -> int:
+    """Index of the last character that still fits in `max_width`."""
+    width = 0
+    for index, char in enumerate(text):
+        width += display_width(char)
+        if width > max_width:
+            return index
+    return len(text)
+
+
 class SentenceAssembler:
     """Group committed transcript fragments into whole sentences.
 
@@ -596,9 +612,13 @@ class SentenceAssembler:
             if match:
                 self._emit(match.end(), output)
                 continue
-            if len(self._text) > self.max_chars:
-                cut = self._text.rfind(" ", 0, self.max_chars + 1)
-                self._emit(cut if cut > self.max_chars // 2 else self.max_chars, output)
+            # `max_chars` is in Korean characters; English gets about twice
+            # as many letters for the same amount of speech.
+            max_width = 2 * self.max_chars
+            if display_width(self._text) > max_width:
+                limit = _width_cut(self._text, max_width)
+                cut = self._text.rfind(" ", 0, limit + 1)
+                self._emit(cut if cut > limit // 2 else limit, output)
                 continue
             break
 

@@ -746,7 +746,9 @@ async def process_audio_sentence(
     global LAST_METRICS
 
     chunk_seconds = config_float("sentence_chunk_seconds", 2.0, 0.5, 6.0)
-    trim_seconds = config_float("sentence_trim_seconds", 10.0, 4.0, 25.0)
+    # Keep about one sentence of context. With 10 s of audio, Whisper sometimes
+    # stopped early and skipped the last sentence at the end of the buffer.
+    trim_seconds = config_float("sentence_trim_seconds", 6.0, 4.0, 25.0)
     max_buffer_seconds = max(
         trim_seconds, config_float("sentence_max_buffer_seconds", 20.0, 6.0, 30.0)
     )

@@ -12,6 +12,7 @@ from streaming import (  # noqa: E402
     SentenceAssembler,
     TranscriptSegment,
     Word,
+    display_width,
     words_to_segment,
 )
 
@@ -71,9 +72,17 @@ class SentenceAssemblerTests(unittest.TestCase):
             next_start=6.1,
         )
         self.assertTrue(done)
-        self.assertTrue(all(len(item.text) <= 20 for item in done))
+        self.assertTrue(all(display_width(item.text) <= 40 for item in done))
         joined = " ".join([item.text for item in done] + [assembler.pending().text])
         self.assertEqual(joined, "픽스드 포인트와 플로팅 포인트는 정확도와 표현 범위에서 서로 다른")
+
+    def test_english_gets_twice_as_many_letters_before_a_forced_split(self) -> None:
+        # Real-model case: an 84-letter English sentence was cut at 60
+        # characters and translated as two broken halves.
+        assembler = SentenceAssembler(max_chars=60)
+        sentence = "The court ruled that he was not criminally liable because he acted in self-defense."
+        done = assembler.add([seg(0.0, 5.0, sentence)], audio_end=7.0, next_start=5.1)
+        self.assertEqual([item.text for item in done], [sentence])
 
     def test_flush_emits_unfinished_sentence(self) -> None:
         assembler = SentenceAssembler()
