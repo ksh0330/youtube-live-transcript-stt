@@ -1,5 +1,11 @@
 # 변경 이력
 
+## v0.3.2 — 마지막 문장 유실 수정, GPU 안내
+
+- 중지할 때 마지막 짧은 구간이 임시 문장의 뒷부분만 다시 인식하면 문장 앞부분이 사라지던 문제 수정 (v0.3.1 이전부터 있던 문제)
+- 이 PC 전용 설정 파일 `server_config.local.json` 지원 (Git 제외, 기본 설정 위에 덮어씀)
+- README에 NVIDIA GPU 설정과 RTX 5060 Ti 측정값 추가 (small CPU 1.85초 → GPU 0.21초 / 6초 window)
+
 ## v0.3.1 — 경계 중복 출력 수정
 
 - 다음 window가 임시 자막을 다시 인식할 때 Whisper 타임스탬프가 0.25초 이상 밀리면 같은 문장이 두 번 확정되던 문제 수정 (시간 허용 범위 1초, `reprediction_tolerance_seconds`)
