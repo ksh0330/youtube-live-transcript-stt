@@ -11,6 +11,8 @@
   let activeSessionId = null;
   let stopAckResolver = null;
   let inputRate = 48000;
+  // 16 kHz samples sent this session: the server's audio clock.
+  let samplesSent = 0;
   const TARGET_RATE = 16000;
 
   async function reportStatus(status, error = null, sessionId = activeSessionId) {
@@ -188,6 +190,7 @@
               new_seconds: data.new_seconds,
               window_seconds: data.window_seconds,
               mode: data.mode,
+              generation: data.generation,
               language: data.language
             });
           } else if (data.type === "transcript" && data.text) {
@@ -222,6 +225,7 @@
 
   async function startCapture({ streamId, wsUrl, language, initialPrompt, sessionId, translateTo }) {
     await stopCapture({ flush: false });
+    samplesSent = 0;
     activeSessionId = sessionId || `${Date.now()}`;
     const currentSessionId = activeSessionId;
     await reportStatus("connecting", null, currentSessionId);
@@ -273,6 +277,7 @@
       if (pcm16.byteLength) {
         try {
           socket.send(pcm16.buffer);
+          samplesSent += pcm16.length;
         } catch (error) {
           reportError(error);
         }
@@ -303,6 +308,21 @@
           sendResponse({ ok: false, error: String(error?.message || error) });
         });
       return true;
+    }
+
+    if (message.type === "YTLT_OFFSCREEN_RESET") {
+      // Audio sent so far belongs to the old video position. Messages on the
+      // socket stay in order, so everything after this reset is new audio.
+      const audioSeconds = samplesSent / TARGET_RATE;
+      let ok = false;
+      if (running && socket?.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(JSON.stringify({ type: "reset", generation: message.generation }));
+          ok = true;
+        } catch (_) {}
+      }
+      sendResponse({ ok, audioSeconds });
+      return;
     }
 
     if (message.type === "YTLT_OFFSCREEN_STOP") {

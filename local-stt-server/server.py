@@ -30,6 +30,7 @@ from streaming import (
     TranscriptSegment,
     TranscriptStabilizer,
     Word,
+    collapse_repetitions,
     map_model_segments,
     normalize_text,
     words_to_segment,
@@ -291,6 +292,10 @@ def provisional_payload(
     if pending:
         items.append({**pending.as_dict(), "stable": True})
     items += [item.as_dict() for item in unstable]
+    # Finished sentences already collapse Whisper loops; do the same for the
+    # sentence on screen so "전국의 전국의 전국의 ..." never fills the overlay.
+    for item in items:
+        item["text"] = collapse_repetitions(str(item["text"])) or item["text"]
     return items
 
 
@@ -307,17 +312,28 @@ def session_language(client_config: dict[str, Any]) -> str | None:
 
 
 def remember_detection(client_config: dict[str, Any], detected: dict[str, Any]) -> None:
-    """Lock an auto-detected language for the rest of the session, so short
-    windows of music or names do not flip the language back and forth."""
+    """Lock an auto-detected language until the video position changes, so
+    short windows of music or names do not flip the language back and forth.
+    Two confident detections in a row are needed: one short clip (such as a
+    Korean ad before an English stream) must not lock the wrong language."""
     if str(client_config.get("language", "")).lower() != "auto":
         return
     if client_config.get("locked_language"):
         return
     language = detected.get("language")
     probability = float(detected.get("probability") or 0.0)
-    if language and probability >= AUTO_LANGUAGE_LOCK_PROBABILITY:
-        client_config["locked_language"] = language
-        log.info("Detected language locked: %s (%.2f)", language, probability)
+    if not language or probability < AUTO_LANGUAGE_LOCK_PROBABILITY:
+        client_config.pop("language_candidate", None)
+        return
+    if client_config.get("language_candidate") != language:
+        client_config["language_candidate"] = language
+        return
+    client_config["locked_language"] = language
+    log.info("Detected language locked: %s (%.2f)", language, probability)
+
+
+def reset_generation(client_config: dict[str, Any]) -> int:
+    return int(client_config.get("reset_generation", 0) or 0)
 
 
 def source_language(client_config: dict[str, Any], detected: dict[str, Any]) -> str | None:
@@ -547,6 +563,19 @@ async def receive_audio(
                         asyncio.get_running_loop().run_in_executor(
                             None, preload_translator
                         )
+                elif data.get("type") == "reset":
+                    # The viewer jumped to another point in the video (or an
+                    # ad ended): queued audio and the current sentence belong
+                    # to the old position, and the language may differ.
+                    audio_buffer.discard()
+                    try:
+                        generation = int(data.get("generation"))
+                    except (TypeError, ValueError):
+                        generation = int(client_config.get("reset_generation", 0)) + 1
+                    client_config["reset_generation"] = generation
+                    client_config.pop("locked_language", None)
+                    client_config.pop("language_candidate", None)
+                    log.info("Video position changed: transcription state reset")
                 elif data.get("type") == "stop":
                     graceful_stop.set()
                     audio_buffer.keep_latest(
@@ -613,9 +642,25 @@ async def process_audio(
     sequence = 0
     latest_audio_end = 0.0
     last_detected: dict[str, Any] = {}
+    generation = reset_generation(client_config)
 
     async def process_chunk(raw: bytes, start_sample: int) -> bool:
         nonlocal overlap_tail, previous_new_end_sample, sequence, latest_audio_end
+        nonlocal stabilizer, assembler, generation
+
+        if reset_generation(client_config) != generation:
+            # The video position changed: start over from this chunk.
+            generation = reset_generation(client_config)
+            stabilizer = TranscriptStabilizer(
+                horizon_seconds,
+                config_float("reprediction_tolerance_seconds", 1.0, 0.25, 3.0),
+            )
+            assembler = make_sentence_assembler(
+                horizon_seconds + config_float("sentence_pause_seconds", 0.8, 0.2, 3.0)
+            )
+            overlap_tail = b""
+            previous_new_end_sample = None
+            last_detected.clear()
 
         sample_count = len(raw) // BYTES_PER_SAMPLE
         contiguous = previous_new_end_sample is None or start_sample == previous_new_end_sample
@@ -646,6 +691,8 @@ async def process_audio(
                 detected,
             )
         inference_ms = (time.perf_counter() - started) * 1000
+        if reset_generation(client_config) != generation:
+            return True  # audio from before the jump: drop the result
         if relative_segments:
             remember_detection(client_config, detected)
             last_detected.update(detected)
@@ -702,6 +749,7 @@ async def process_audio(
                 "window_seconds": round(len(window) / BYTES_PER_SAMPLE / SAMPLE_RATE, 3),
                 "mode": "rolling",
                 "language": source_language(client_config, last_detected),
+                "generation": generation,
                 **LAST_METRICS,
             },
         )
@@ -729,6 +777,7 @@ async def process_audio(
     await send_final_flush(
         websocket, flushed_items, sequence, latest_audio_end, audio_buffer, graceful_stop,
         mode="rolling", language=source_language(client_config, last_detected),
+        generation=generation,
     )
 
 
@@ -742,6 +791,7 @@ async def send_final_flush(
     *,
     mode: str,
     language: str | None,
+    generation: int = 0,
 ) -> None:
     if not graceful_stop.is_set():
         return
@@ -759,6 +809,7 @@ async def send_final_flush(
                 "dropped_seconds": round(audio_buffer.dropped_seconds, 3),
                 "mode": mode,
                 "language": language,
+                "generation": generation,
             },
         )
     await websocket_send_json(websocket, {"type": "stop_ack"})
@@ -798,11 +849,23 @@ async def process_audio_sentence(
     sequence = 0
     latest_audio_end = 0.0
     last_detected: dict[str, Any] = {}
+    generation = reset_generation(client_config)
 
     async def process_chunk(raw: bytes, start_sample: int) -> bool:
         nonlocal buffer, buffer_start, previous_end_sample, sequence, latest_audio_end
+        nonlocal agreement, assembler, generation
 
         sample_count = len(raw) // BYTES_PER_SAMPLE
+        if reset_generation(client_config) != generation:
+            # The video position changed: start over from this chunk.
+            generation = reset_generation(client_config)
+            agreement = LocalAgreement()
+            assembler = make_sentence_assembler(
+                2 * chunk_seconds + config_float("sentence_pause_seconds", 0.8, 0.2, 3.0)
+            )
+            buffer = np.zeros((0,), dtype=np.float32)
+            previous_end_sample = None
+            last_detected.clear()
         if previous_end_sample is not None and start_sample != previous_end_sample:
             log.warning(
                 "Audio backlog overflow: skipped %.2fs to preserve live position.",
@@ -828,6 +891,8 @@ async def process_audio_sentence(
                 detected,
             )
         inference_ms = (time.perf_counter() - started) * 1000
+        if reset_generation(client_config) != generation:
+            return True  # audio from before the jump: drop the result
         if relative_words:
             remember_detection(client_config, detected)
             last_detected.update(detected)
@@ -891,6 +956,7 @@ async def process_audio_sentence(
                 "window_seconds": round(buffer.size / SAMPLE_RATE, 3),
                 "mode": "sentence",
                 "language": source_language(client_config, last_detected),
+                "generation": generation,
                 **LAST_METRICS,
             },
         )
@@ -917,10 +983,11 @@ async def process_audio_sentence(
     await send_final_flush(
         websocket, flushed_items, sequence, latest_audio_end, audio_buffer, graceful_stop,
         mode="sentence", language=source_language(client_config, last_detected),
+        generation=generation,
     )
 
 
-app = FastAPI(title="YouTube Live Local STT", version="0.4.3")
+app = FastAPI(title="YouTube Live Local STT", version="0.4.4")
 
 
 @app.get("/health")

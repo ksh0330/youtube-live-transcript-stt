@@ -45,10 +45,21 @@ class AutoLanguageTests(unittest.TestCase):
         server.remember_detection(config, {"language": "en", "probability": 0.55})
         self.assertIsNone(server.session_language(config))
         server.remember_detection(config, {"language": "ja", "probability": 0.93})
+        # One confident window is not enough (a short ad in another language).
+        self.assertIsNone(server.session_language(config))
+        server.remember_detection(config, {"language": "ja", "probability": 0.91})
         self.assertEqual(server.session_language(config), "ja")
         # Once locked, a later detection does not flip it.
         server.remember_detection(config, {"language": "en", "probability": 0.99})
         self.assertEqual(server.session_language(config), "ja")
+
+    def test_a_different_language_restarts_the_count(self) -> None:
+        config = {"language": "auto"}
+        server.remember_detection(config, {"language": "ko", "probability": 0.95})
+        server.remember_detection(config, {"language": "en", "probability": 0.95})
+        self.assertIsNone(server.session_language(config))
+        server.remember_detection(config, {"language": "en", "probability": 0.97})
+        self.assertEqual(server.session_language(config), "en")
 
     def test_explicit_language_is_used_as_is(self) -> None:
         config = {"language": "en"}

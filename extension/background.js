@@ -44,6 +44,7 @@ function emptySession(settings = DEFAULT_SETTINGS) {
     startedAt: null,
     stoppedAt: null,
     timelineOrigin: 0,
+  resetGeneration: 0,
     metadata: null,
     segments: [],
     provisional: [],
@@ -264,6 +265,7 @@ async function startCaptureWithStream(streamId, tabId) {
     tabId,
     startedAt: new Date().toISOString(),
     timelineOrigin: Number.isFinite(info.currentTime) ? Math.max(0, info.currentTime) : 0,
+    resetGeneration: 0,
     metadata: {
       title: info.title || tab.title || "YouTube",
       url: info.url || tab.url || "",
@@ -320,12 +322,17 @@ function normalizedIncomingSegment(item, sequence, index) {
 
 function appendFinalized(items, sequence) {
   const appended = [];
+  const generation = Number(session.resetGeneration) || 0;
   for (let index = 0; index < items.length; index++) {
     const segment = normalizedIncomingSegment(items[index], sequence, index);
     if (!segment) continue;
+    segment.generation = generation;
+    // After a jump the timeline restarts, possibly earlier in the video, so
+    // only compare against segments from the same position.
     const last = session.segments.at(-1);
-    if (last && segment.end <= last.end + 0.03) continue;
-    if (last && segment.start < last.end) segment.start = last.end;
+    const sameRun = last && (Number(last.generation) || 0) === generation;
+    if (sameRun && segment.end <= last.end + 0.03) continue;
+    if (sameRun && segment.start < last.end) segment.start = last.end;
     if (segment.end <= segment.start) segment.end = segment.start + 0.05;
     session.segments.push(segment);
     appended.push(segment);
@@ -344,6 +351,8 @@ async function appendTranscriptUpdate(message) {
   if (message.sessionId && message.sessionId !== session.sessionId) return;
   const sequence = Number(message.sequence) || session.lastSequence + 1;
   if (sequence <= session.lastSequence) return;
+  // Results for audio from before the last jump would land at the wrong time.
+  if ((Number(message.generation) || 0) < (Number(session.resetGeneration) || 0)) return;
 
   const finalized = appendFinalized(Array.isArray(message.finalized) ? message.finalized : [], sequence);
   session.provisional = (Array.isArray(message.provisional) ? message.provisional : [])
@@ -510,6 +519,36 @@ async function openDetachedWindow() {
   return { windowId: detachedWindowId, reused: false };
 }
 
+// The viewer sought, skipped or an ad ended: restart recognition at the new
+// position instead of mixing audio (and the detected language) from both.
+async function handleVideoJump(message, sender) {
+  await loadSession();
+  const tabId = sender?.tab?.id;
+  if (!session.recording || session.tabId !== tabId) return { ok: true, ignored: true };
+  const generation = (Number(session.resetGeneration) || 0) + 1;
+  let response = null;
+  try {
+    response = await chrome.runtime.sendMessage({
+      type: "YTLT_OFFSCREEN_RESET",
+      target: "offscreen",
+      generation
+    });
+  } catch (_) {}
+  if (!response?.ok) return { ok: false };
+
+  promoteProvisional();
+  session.provisional = [];
+  session.resetGeneration = generation;
+  // Server audio time `audioSeconds` now corresponds to this video time.
+  const videoTime = Number.isFinite(message.currentTime) ? message.currentTime : null;
+  if (videoTime !== null) {
+    session.timelineOrigin = Math.max(0, videoTime - (Number(response.audioSeconds) || 0));
+  }
+  await broadcastFull();
+  await syncOverlay();
+  return { ok: true, generation };
+}
+
 async function handleContentReady(message, sender) {
   await loadSession();
   const tabId = sender?.tab?.id;
@@ -611,6 +650,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       case "YTLT_SET_SETTINGS":
         sendResponse({ ok: true, state: await updateSettings(message.settings) });
+        return;
+
+      case "YTLT_VIDEO_JUMPED":
+        sendResponse(await handleVideoJump(message, sender));
         return;
 
       case "YTLT_CONTENT_READY":

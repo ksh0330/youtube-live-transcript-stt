@@ -342,6 +342,31 @@ class WebSocketLifecycleTests(unittest.TestCase):
         restarted = self._run_session()
         self.assertEqual(restarted[0]["sequence"], 1)
 
+    def test_reset_after_a_jump_starts_a_new_generation(self) -> None:
+        pcm = np.zeros(server.SAMPLE_RATE * 2, dtype="<i2").tobytes()
+        with TestClient(server.app).websocket_connect("/ws/transcribe") as websocket:
+            websocket.receive_json()
+            websocket.receive_json()
+            websocket.send_json({"type": "config", "language": "ko"})
+            websocket.send_bytes(pcm)
+            before = websocket.receive_json()
+            websocket.send_json({"type": "reset", "generation": 1})
+            websocket.send_bytes(pcm)
+            after = websocket.receive_json()
+            websocket.send_json({"type": "stop"})
+            flushed = []
+            while True:
+                message = websocket.receive_json()
+                if message.get("type") == "stop_ack":
+                    break
+                flushed.append(message)
+
+        self.assertEqual(before["generation"], 0)
+        self.assertEqual(after["generation"], 1)
+        # The sentence from before the jump is not carried over as text after it.
+        self.assertEqual(after["finalized"], [])
+        self.assertTrue(all(item["generation"] == 1 for item in flushed))
+
 
 @dataclass
 class FakeWord:

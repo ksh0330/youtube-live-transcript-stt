@@ -22,6 +22,7 @@
   let overlayState = { enabled: false, text: "", settings: DEFAULT_SETTINGS };
   let playerObserver = null;
   let observedPlayer = null;
+  let sizeObserver = null;
 
   function getVideo() {
     return document.querySelector("video.html5-main-video, video");
@@ -89,6 +90,76 @@
       }
     });
     playerObserver.observe(player, { attributes: true, attributeFilter: ["class"] });
+    // Re-render on resize so the caption size follows the player.
+    sizeObserver?.disconnect();
+    let lastHeight = player.clientHeight;
+    sizeObserver = new ResizeObserver(() => {
+      if (Math.abs(player.clientHeight - lastHeight) < 8) return;
+      lastHeight = player.clientHeight;
+      if (overlayState.enabled) renderOverlay(true, overlayState.text, overlayState.settings);
+    });
+    sizeObserver.observe(player);
+  }
+
+  // Seeking, skipping or an ad ending makes the video time jump. Tell the
+  // background so the server drops audio from the old position and the
+  // timeline restarts at the new one.
+  let watchedVideo = null;
+  let lastVideoTime = null;
+  let lastWallTime = 0;
+  let lastAdShowing = false;
+  let jumpTimer = null;
+
+  function resetVideoBaseline() {
+    const video = getVideo();
+    lastVideoTime = video && Number.isFinite(video.currentTime) ? video.currentTime : null;
+    lastWallTime = performance.now();
+  }
+
+  function reportJump() {
+    clearTimeout(jumpTimer);
+    // Dragging the seek bar fires many events; report once it settles.
+    jumpTimer = setTimeout(() => {
+      const video = getVideo();
+      try {
+        chrome.runtime.sendMessage({
+          type: "YTLT_VIDEO_JUMPED",
+          target: "background",
+          currentTime: video && Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : null,
+          adShowing: lastAdShowing
+        }).catch(() => {});
+      } catch (_) {} // this copy was orphaned by an extension reload
+    }, 700);
+  }
+
+  function checkVideoTime() {
+    const video = getVideo();
+    if (!video || !Number.isFinite(video.currentTime)) return;
+    const now = performance.now();
+    const adShowing = Boolean(getPlayer()?.classList.contains("ad-showing"));
+    if (lastVideoTime !== null) {
+      const expected = lastVideoTime + ((now - lastWallTime) / 1000) * (video.playbackRate || 1);
+      if (Math.abs(video.currentTime - expected) > 2.5 || adShowing !== lastAdShowing) {
+        lastAdShowing = adShowing;
+        reportJump();
+      }
+    }
+    lastAdShowing = adShowing;
+    lastVideoTime = video.currentTime;
+    lastWallTime = now;
+  }
+
+  function watchVideo() {
+    const video = getVideo();
+    if (!video || video === watchedVideo) return;
+    watchedVideo = video;
+    video.addEventListener("timeupdate", checkVideoTime);
+    video.addEventListener("seeked", checkVideoTime);
+    // Time stands still while paused or buffering: not a jump.
+    for (const name of ["pause", "play", "playing", "waiting", "ratechange"]) {
+      video.addEventListener(name, resetVideoBaseline);
+    }
+    resetVideoBaseline();
   }
 
   function renderOverlay(enabled, text, settings = {}) {
@@ -106,6 +177,7 @@
     const player = getPlayer();
     if (!player) return;
     observePlayer(player);
+    watchVideo();
     if (!node) {
       node = document.createElement("div");
       node.id = OVERLAY_ID;
@@ -113,7 +185,11 @@
     }
     if (node.parentElement !== player) player.appendChild(node);
 
-    const sizeMap = { small: "15px", medium: "18px", large: "22px" };
+    // Sizes are for a normal ~480 px tall player; scale up with the player
+    // (theater mode, fullscreen) like YouTube's own captions do.
+    const sizeMap = { small: 15, medium: 18, large: 22 };
+    const scale = Math.max(1, Math.min(2.2, (player.clientHeight || 480) / 480));
+    const baseSize = sizeMap[overlayState.settings.overlaySize] || sizeMap.medium;
     const opacity = Math.max(0.5, Math.min(0.9, Number(overlayState.settings.overlayOpacity) || 0.8));
     Object.assign(node.style, {
       position: "absolute",
@@ -125,7 +201,7 @@
       borderRadius: "6px",
       background: `rgba(0,0,0,${opacity})`,
       color: "#fff",
-      fontSize: sizeMap[overlayState.settings.overlaySize] || sizeMap.medium,
+      fontSize: `${Math.round(baseSize * scale)}px`,
       lineHeight: "1.5",
       fontFamily: "Arial, sans-serif",
       textAlign: "center",
@@ -164,8 +240,12 @@
   });
 
   document.addEventListener("yt-navigate-finish", () => {
-    setTimeout(() => syncFromBackground("YTLT_PAGE_CHANGED"), 250);
+    setTimeout(() => {
+      watchVideo();
+      syncFromBackground("YTLT_PAGE_CHANGED");
+    }, 250);
   });
+  watchVideo();
   document.addEventListener("fullscreenchange", () => {
     if (overlayState.enabled) renderOverlay(true, overlayState.text, overlayState.settings);
   });
