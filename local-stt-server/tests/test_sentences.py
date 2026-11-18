@@ -13,6 +13,7 @@ from streaming import (  # noqa: E402
     TranscriptSegment,
     Word,
     display_width,
+    split_index,
     words_to_segment,
 )
 
@@ -83,6 +84,18 @@ class SentenceAssemblerTests(unittest.TestCase):
         sentence = "The court ruled that he was not criminally liable because he acted in self-defense."
         done = assembler.add([seg(0.0, 5.0, sentence)], audio_end=7.0, next_start=5.1)
         self.assertEqual([item.text for item in done], [sentence])
+
+    def test_japanese_is_not_split_inside_a_katakana_word(self) -> None:
+        # Real-model case: a run-on Japanese sentence was cut as
+        # "…最高齢のレッサーパ" / "ンダとして…" and both halves mistranslated.
+        text = "存命中の最高齢のレッサーパンダとしてギネス世界記録に認定されました"
+        cut = split_index(text, 2 * 12)
+        self.assertEqual(text[:cut], "存命中の最高齢の")
+
+    def test_japanese_prefers_a_comma(self) -> None:
+        text = "平均寿命が12から17歳と言われる中、23歳の風太くんは驚きの長寿です"
+        cut = split_index(text, 2 * 20)
+        self.assertEqual(text[:cut], "平均寿命が12から17歳と言われる中、")
 
     def test_flush_emits_unfinished_sentence(self) -> None:
         assembler = SentenceAssembler()

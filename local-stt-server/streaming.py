@@ -476,6 +476,12 @@ class BoundedAudioBuffer:
         self.closed = True
         self._changed.set()
 
+    def discard(self) -> None:
+        """Drop all queued audio, e.g. after the viewer jumps to another point
+        in the video. Not counted as dropped: it was skipped on purpose."""
+        self._start_sample += len(self._data) // self.bytes_per_sample
+        self._data.clear()
+
     def keep_latest(self, seconds: float) -> None:
         keep_bytes = int(self.sample_rate * self.bytes_per_sample * max(0.0, seconds))
         keep_bytes -= keep_bytes % self.bytes_per_sample
@@ -531,6 +537,34 @@ def _width_cut(text: str, max_width: int) -> int:
         if width > max_width:
             return index
     return len(text)
+
+
+_SOFT_BREAKS = " 　、，,"
+
+
+def _word_class(char: str) -> str:
+    """Rough script of a character, used to avoid splitting inside a word
+    such as a katakana loanword or an English word."""
+    if "゠" <= char <= "ヿ" or char == "ー":
+        return "katakana"
+    if char.isascii() and char.isalnum():
+        return "latin"
+    return ""
+
+
+def split_index(text: str, max_width: int) -> int:
+    """Where to split a sentence that grew past `max_width` without
+    punctuation: after the last space or comma in the second half, otherwise
+    at the width limit moved back to the start of a word that would be cut
+    (Japanese has no spaces, so "レッサーパ|ンダ" must not happen)."""
+    limit = _width_cut(text, max_width)
+    for index in range(limit, limit // 2, -1):
+        if text[index - 1] in _SOFT_BREAKS:
+            return index
+    cut = limit
+    while 0 < cut < len(text) and _word_class(text[cut]) and _word_class(text[cut - 1]) == _word_class(text[cut]):
+        cut -= 1
+    return cut if cut > limit // 2 else limit
 
 
 class SentenceAssembler:
@@ -616,9 +650,7 @@ class SentenceAssembler:
             # as many letters for the same amount of speech.
             max_width = 2 * self.max_chars
             if display_width(self._text) > max_width:
-                limit = _width_cut(self._text, max_width)
-                cut = self._text.rfind(" ", 0, limit + 1)
-                self._emit(cut if cut > limit // 2 else limit, output)
+                self._emit(split_index(self._text, max_width), output)
                 continue
             break
 

@@ -105,6 +105,10 @@ class SentenceTranslator:
                 target_prefix=[[target_code]] * len(batch),
                 beam_size=2,
                 max_decoding_length=256,
+                # Stops loops such as "23살의 타쿠는 23살의 타쿠는 ..." on
+                # Japanese input without dropping content (a repetition
+                # penalty cut whole clauses in testing).
+                no_repeat_ngram_size=4,
             )
         output = []
         for text, result in zip(texts, results):
